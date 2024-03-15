@@ -1,4 +1,4 @@
-module github.com/HeimdallCyberSecurity/Gungnir
+module github.com/g0ldencybersec/gungnir
 
 go 1.21.5
 
