@@ -34,9 +34,7 @@ var (
 
 	matchSubjectRegex = `^(?:(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}|localhost)$` // Regex to match CN/SAN
 
-	numWorkers    = 2 // Number of concurrent matchers
-	parallelFetch = 2 // Number of concurrent GetEntries fetches
-	rootDomains   map[string]bool
+	rootDomains map[string]bool
 )
 
 func getLogUrls() ([]string, error) {
@@ -171,10 +169,6 @@ func createMatcherFromFlags() (interface{}, error) {
 func scanLog(ctx context.Context, logURI string, wg *sync.WaitGroup, httpClient *http.Client) {
 	defer wg.Done()
 
-	var startIndex int64
-	var endIndex int64
-	var batchSize int
-
 	log.Printf("Starting continuous scan for log: %s", logURI)
 	logClient, err := client.New(logURI, httpClient, jsonclient.Options{UserAgent: "ct-go-scanlog/1.0"})
 	if err != nil {
@@ -187,58 +181,32 @@ func scanLog(ctx context.Context, logURI string, wg *sync.WaitGroup, httpClient 
 		log.Printf("Failed to get STH for log %s: %v", logURI, err)
 		return
 	}
-	if int64(sth.TreeSize) < int64(batchSize) {
-		startIndex = 0
-	} else {
-		startIndex = int64(sth.TreeSize) - int64(batchSize)
-	}
-	endIndex = int64(sth.TreeSize)
 
 	matcher, err := createMatcherFromFlags()
 	if err != nil {
 		log.Printf("Failed to create matcher for log %s: %v", logURI, err)
 		return
 	}
-	time.Sleep(time.Second * 15)
+	time.Sleep(time.Second * 10)
 	// Continous Scanning Loop
-	for {
-		opts := scanner.ScannerOptions{
-			FetcherOptions: scanner.FetcherOptions{
-				BatchSize:     int(endIndex) - int(startIndex),
-				ParallelFetch: parallelFetch,
-				StartIndex:    startIndex,
-				// You might want to adjust EndIndex based on the STH or leave it 0 to scan up to the latest entry.
-				EndIndex: endIndex,
-			},
-			Matcher:    matcher,
-			NumWorkers: numWorkers,
-		}
-		// log.Printf("Log: %s == Index: %d", logURI, startIndex)
-		s := scanner.NewScanner(logClient, opts)
 
-		err = s.Scan(ctx, logCertInfo, logPrecertInfo)
-		if err != nil {
-			log.Printf("Failed to scan log %s: %v", logURI, err)
-			// Consider whether to continue or break/return based on the type of error.
-		}
+	certScanner := scanner.NewScanner(logClient, scanner.ScannerOptions{
+		FetcherOptions: scanner.FetcherOptions{
+			BatchSize:     100,
+			ParallelFetch: 1,
+			StartIndex:    int64(sth.TreeSize), // Start at the latest STH to skip all the past certificates
+			Continuous:    true,
+		},
+		Matcher:     matcher,
+		PrecertOnly: false,
+		NumWorkers:  1,
+		BufferSize:  1000,
+	})
 
-		// Updating indices
-		for {
-			sth, err := logClient.GetSTH(ctx)
-			if err != nil {
-				log.Printf("Failed to get STH for log %s after scan: %v", logURI, err)
-				// Decide on action based on error - break, continue, or retry getting STH.
-			}
-
-			if int64(sth.TreeSize) > endIndex+1 {
-				startIndex = endIndex + 1
-				endIndex = int64(sth.TreeSize)
-				break
-			}
-			time.Sleep(time.Second * 30)
-		}
-
-		time.Sleep(time.Second * 30) // Wait for 30 seconds or adjust as needed=
+	err = certScanner.Scan(ctx, logCertInfo, logPrecertInfo)
+	if err != nil {
+		log.Printf("Failed to scan log %s: %v", logURI, err)
+		// Consider whether to continue or break/return based on the type of error.
 	}
 }
 
@@ -257,18 +225,8 @@ func main() {
 	}
 
 	httpClient := &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			TLSHandshakeTimeout:   30 * time.Second,
-			ResponseHeaderTimeout: 30 * time.Second,
-			MaxIdleConnsPerHost:   10,
-			DisableKeepAlives:     false,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
+		Timeout: 30 * time.Second,
 	}
-
 	var wg sync.WaitGroup
 	ctx := context.Background()
 
