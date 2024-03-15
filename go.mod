@@ -1,17 +1,21 @@
 module github.com/g0ldencybersec/gungnir
 
-go 1.20
+go 1.21
 
-require github.com/google/certificate-transparency-go v1.1.7
+toolchain go1.21.5
+
+require github.com/google/certificate-transparency-go v1.1.8
 
 require (
-	github.com/go-logr/logr v1.2.4 // indirect
-	github.com/golang/protobuf v1.5.3 // indirect
-	github.com/google/trillian v1.5.3 // indirect
-	golang.org/x/crypto v0.17.0 // indirect
-	golang.org/x/net v0.17.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20231016165738-49dd2c1f3d0b // indirect
-	google.golang.org/grpc v1.59.0 // indirect
-	google.golang.org/protobuf v1.31.0 // indirect
-	k8s.io/klog/v2 v2.100.1 // indirect
+	github.com/go-logr/logr v1.4.1 // indirect
+	github.com/golang/protobuf v1.5.4 // indirect
+	github.com/google/trillian v1.6.0 // indirect
+	golang.org/x/crypto v0.21.0 // indirect
+	golang.org/x/net v0.22.0 // indirect
+	golang.org/x/sys v0.18.0 // indirect
+	golang.org/x/text v0.14.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20240314234333-6e1732d8331c // indirect
+	google.golang.org/grpc v1.62.1 // indirect
+	google.golang.org/protobuf v1.33.0 // indirect
+	k8s.io/klog/v2 v2.120.1 // indirect
 )
