@@ -243,7 +243,14 @@ func scanLog(ctx context.Context, logURI string, wg *sync.WaitGroup, httpClient 
 }
 
 func main() {
-	loadRootDomains(os.Args[1])
+	if len(os.Args) > 1 {
+		loadRootDomains(os.Args[1])
+	} else {
+		fmt.Println("Please run with a roots.txt file...")
+		fmt.Println("ex: ./gungnir roots.txt")
+		os.Exit(1)
+	}
+
 	logURIs, err := getLogUrls()
 	if err != nil {
 		panic(err)

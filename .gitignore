@@ -19,5 +19,5 @@
 
 # Go workspace file
 go.work
-roots.txt
-patterns.txt
+
+gungnir/gungnir
