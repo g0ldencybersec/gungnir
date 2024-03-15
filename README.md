@@ -23,11 +23,17 @@ go install github.com/g0ldencybersec/gungnir/gungnir@latest
 ```
 
 ## Usage
+# Options
+```sh
+Usage of gungnir:
+  -r string Path to the list of root domains to filter against
+  -v    Output go logs (500/429 errors) to command line
+```
 
 To run the tool, use a text file of root domains you want to monitor: `roots.txt`. Then, run the `gungnir` module:
 
 ```sh
-./gungnir roots.txt
+./gungnir -r roots.txt
 ```
 
 Once the tool starts and initializes, it will print domains to stdout. So feel free to pipe the output into your favorite tool!

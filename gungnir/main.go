@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -35,7 +36,23 @@ var (
 	matchSubjectRegex = `^(?:(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}|localhost)$` // Regex to match CN/SAN
 
 	rootDomains map[string]bool
+	sLogger     = SilentLogger{}
+	bLogger     = basicLogger{}
 )
+
+// SilentLogger is a custom logger that does nothing
+type SilentLogger struct{}
+
+// Printf method for SilentLogger that does nothing
+func (l *SilentLogger) Printf(format string, v ...interface{}) {
+	// Intentionally left blank to not log anything
+}
+
+type basicLogger struct{}
+
+func (bl *basicLogger) Printf(msg string, args ...interface{}) {
+	log.Printf(msg, args...)
+}
 
 func getLogUrls() ([]string, error) {
 	var logList []string
@@ -166,14 +183,24 @@ func createMatcherFromFlags() (interface{}, error) {
 		PrecertificateSubjectRegex: precertRegex}, nil
 }
 
-func scanLog(ctx context.Context, logURI string, wg *sync.WaitGroup, httpClient *http.Client) {
+func scanLog(ctx context.Context, logURI string, wg *sync.WaitGroup, httpClient *http.Client, verbose bool) {
 	defer wg.Done()
 
+	var logClient *client.LogClient
+	var err error
 	log.Printf("Starting continuous scan for log: %s", logURI)
-	logClient, err := client.New(logURI, httpClient, jsonclient.Options{UserAgent: "ct-go-scanlog/1.0"})
-	if err != nil {
-		log.Printf("Failed to create client for log %s: %v", logURI, err)
-		return
+	if verbose {
+		logClient, err = client.New(logURI, httpClient, jsonclient.Options{UserAgent: "ct-go-scanlog/1.0", Logger: &bLogger})
+		if err != nil {
+			log.Printf("Failed to create client for log %s: %v", logURI, err)
+			return
+		}
+	} else {
+		logClient, err = client.New(logURI, httpClient, jsonclient.Options{UserAgent: "ct-go-scanlog/1.0", Logger: &sLogger})
+		if err != nil {
+			log.Printf("Failed to create client for log %s: %v", logURI, err)
+			return
+		}
 	}
 
 	sth, err := logClient.GetSTH(ctx)
@@ -187,8 +214,6 @@ func scanLog(ctx context.Context, logURI string, wg *sync.WaitGroup, httpClient 
 		log.Printf("Failed to create matcher for log %s: %v", logURI, err)
 		return
 	}
-	time.Sleep(time.Second * 10)
-	// Continous Scanning Loop
 
 	certScanner := scanner.NewScanner(logClient, scanner.ScannerOptions{
 		FetcherOptions: scanner.FetcherOptions{
@@ -208,15 +233,24 @@ func scanLog(ctx context.Context, logURI string, wg *sync.WaitGroup, httpClient 
 		log.Printf("Failed to scan log %s: %v", logURI, err)
 		// Consider whether to continue or break/return based on the type of error.
 	}
+
 }
 
 func main() {
-	if len(os.Args) > 1 {
+	var rootList string
+	var verbose bool
+	flag.StringVar(&rootList, "r", "", "Path to the list of root domains to filter against")
+	flag.BoolVar(&verbose, "v", false, "Output go logs (500/429 errors) to command line")
+
+	flag.Parse()
+
+	if rootList != "" {
 		loadRootDomains(os.Args[1])
 	} else {
 		fmt.Println("Please run with a roots.txt file...")
-		fmt.Println("ex: ./gungnir roots.txt")
-		os.Exit(1)
+		flag.PrintDefaults()
+		fmt.Println("ex: ./gungnir -r roots.txt")
+		os.Exit(0)
 	}
 
 	logURIs, err := getLogUrls()
@@ -232,7 +266,7 @@ func main() {
 
 	for _, logURI := range logURIs {
 		wg.Add(1)
-		go scanLog(ctx, logURI, &wg, httpClient)
+		go scanLog(ctx, logURI, &wg, httpClient, verbose)
 	}
 
 	wg.Wait()
