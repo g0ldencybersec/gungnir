@@ -199,7 +199,7 @@ func scanLog(ctx context.Context, logURI string, wg *sync.WaitGroup, httpClient 
 		log.Printf("Failed to create matcher for log %s: %v", logURI, err)
 		return
 	}
-
+	time.Sleep(time.Second * 15)
 	// Continous Scanning Loop
 	for {
 		opts := scanner.ScannerOptions{
