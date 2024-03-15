@@ -10,10 +10,10 @@ By running Gungnir continuously, security professionals can stay ahead of the cu
 
 # Key features:
 
-**Real-time Monitoring:** Actively monitors multiple CT logs for newly issued certificates.
-**Domain Extraction:** Extracts domains and subdomains from certificate subject alternative names and common name.
-**Continuous Output:** Prints discovered domains and subdomains to stdout as they are detected.
-**Customizable Filtering:** Allows filtering output based a text file of root domains.
+- **Real-time Monitoring:** Actively monitors multiple CT logs for newly issued certificates.
+- **Domain Extraction:** Extracts domains and subdomains from certificate subject alternative names and common name.
+- **Continuous Output:** Prints discovered domains and subdomains to stdout as they are detected.
+- **Customizable Filtering:** Allows filtering output based a text file of root domains.
 Gungnir is designed to be a lightweight and efficient tool, making it suitable for running on various platforms, from local machines to cloud instances or containerized environments.
 
 ## Installation
