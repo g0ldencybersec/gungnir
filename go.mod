@@ -1,6 +1,6 @@
 module github.com/g0ldencybersec/gungnir
 
-go 1.23
+go 1.20
 
 require github.com/google/certificate-transparency-go v1.1.7
 
