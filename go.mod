@@ -2,7 +2,10 @@ module github.com/g0ldencybersec/gungnir
 
 go 1.21
 
-require github.com/google/certificate-transparency-go v1.1.8
+require (
+	github.com/google/certificate-transparency-go v1.1.8
+	github.com/google/uuid v1.6.0
+)
 
 require (
 	github.com/go-logr/logr v1.4.1 // indirect
