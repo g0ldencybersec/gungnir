@@ -25,14 +25,6 @@ import (
 	"github.com/google/certificate-transparency-go/x509"
 )
 
-type LogsList struct {
-	Operators []struct {
-		Logs []struct {
-			URL string `json:"url"`
-		} `json:"logs"`
-	} `json:"operators"`
-}
-
 // ctLog contains the latest witnessed STH for a log and a log client.
 type ctLog struct {
 	id     string
@@ -42,11 +34,11 @@ type ctLog struct {
 }
 
 var (
-	logListUrl = "https://www.gstatic.com/ct/log_list/v3/all_logs_list.json"
-
-	// matchSubjectRegex = `^(?:(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}|localhost)$` // Regex to match CN/SAN
-
+	logListUrl  = "https://www.gstatic.com/ct/log_list/v3/all_logs_list.json"
 	rootDomains map[string]bool
+	rootList    string
+	verbose     bool
+	debug       bool
 )
 
 var getByScheme = map[string]func(*url.URL) ([]byte, error){
@@ -118,7 +110,18 @@ func createLogClient(key []byte, url string) (*client.LogClient, error) {
 		Bytes: key,
 	})
 	opts := jsonclient.Options{PublicKey: string(pemPK), UserAgent: "gungnir-" + uuid.New().String()}
-	c, err := client.New(url, http.DefaultClient, opts)
+	c, err := client.New(url, &http.Client{
+		Timeout: 27 * time.Second,
+		Transport: &http.Transport{
+			TLSHandshakeTimeout:   30 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			MaxIdleConnsPerHost:   10,
+			DisableKeepAlives:     false,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+	}, opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create JSON client: %v", err)
 	}
@@ -211,38 +214,37 @@ func logPrecertInfo(entry *ct.RawLogEntry) {
 	}
 }
 
-// func createRegexes(regexValue string) (*regexp.Regexp, *regexp.Regexp) {
-// 	// Make a regex matcher
-// 	var certRegex *regexp.Regexp
-// 	precertRegex := regexp.MustCompile(regexValue)
-// 	certRegex = precertRegex
-
-// 	return certRegex, precertRegex
-// }
-
-// func createMatcherFromFlags() (interface{}, error) {
-// 	certRegex, precertRegex := createRegexes(matchSubjectRegex)
-// 	return scanner.MatchSubjectRegex{
-// 		CertificateSubjectRegex:    certRegex,
-// 		PrecertificateSubjectRegex: precertRegex}, nil
-// }
-
 func scanLog(ctx context.Context, ctl ctLog, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	var err error
 	var start int64
 	var end int64
+	var ticker *time.Ticker
+	baseErrTime := 60
+	errorCount := 1
 
-	ticker := time.NewTicker(time.Second * 15)
-	errTicker := time.NewTicker(time.Second * 60)
+	errTicker := time.NewTicker(time.Second * time.Duration(baseErrTime))
+	if strings.Contains(ctl.name, "Google") {
+		ticker = time.NewTicker(time.Millisecond * 1)
+	} else if strings.Contains(ctl.name, "Sectigo") {
+		ticker = time.NewTicker(time.Second * 4)
+	} else {
+		ticker = time.NewTicker(time.Second * 1)
+	}
 
 	for {
 		ctl.wsth, err = ctl.client.GetSTH(ctx)
 		if err != nil {
-			log.Printf("Failed to get initial STH for log %s: %v", ctl.client.BaseURI(), err)
-			<-errTicker.C // Wait for the next tick.
+			if verbose {
+				log.Printf("Failed to get initial STH for log %s: %v", ctl.client.BaseURI(), err)
+			}
+			<-errTicker.C
+			errorCount++ // Increment Error count
+			errTicker.Reset(time.Second * (time.Duration(baseErrTime) * time.Duration(errorCount)))
 		} else {
+			errorCount = 1 // Reset to 1
+			errTicker.Reset(time.Second * time.Duration(baseErrTime))
 			break
 		}
 	}
@@ -255,23 +257,52 @@ func scanLog(ctx context.Context, ctl ctLog, wg *sync.WaitGroup) {
 
 		entries, err := ctl.client.GetRawEntries(ctx, start, end)
 		if err != nil {
-			log.Printf("Failed to get ENTRIES for log %s: %v\n start: %d  end : %d", ctl.client.BaseURI(), err, start, end)
+			if verbose {
+				log.Printf("Failed to get ENTRIES for log %s: %v\n start: %d  end : %d", ctl.client.BaseURI(), err, start, end)
+			}
+			<-errTicker.C // Wait for the next tick.
+			errorCount++
+			errTicker.Reset(time.Second * (time.Duration(baseErrTime) * time.Duration(errorCount)))
 			continue
+		} else {
+			errorCount = 1
+			errTicker.Reset(time.Second * time.Duration(baseErrTime))
 		}
 
-		start = processEntries(entries, start) - 1
-		<-ticker.C // Wait for the next tick.
+		start = processEntries(entries, start)
+
+		if debug {
+			if end-start > 1 {
+				fmt.Printf("%s end was: %d but made it to %d --> difference of: %d\n", ctl.name, end, start, end-start)
+			}
+		}
+
 		// Get next end
 		for {
+			<-ticker.C // Wait for the next tick.
 			ctl.wsth, err = ctl.client.GetSTH(ctx)
 			if err != nil {
-				log.Printf("Failed to get continue STH for log %s: %v", ctl.client.BaseURI(), err)
-				<-errTicker.C
-				continue
-			}
-			end = int64(ctl.wsth.TreeSize)
-			if start <= end {
-				break
+				if verbose {
+					log.Printf("Failed to get continual STH for log %s: %v", ctl.client.BaseURI(), err)
+				}
+				<-errTicker.C // Wait for the next tick.
+				errorCount++
+				errTicker.Reset(time.Second * (time.Duration(baseErrTime) * time.Duration(errorCount)))
+			} else {
+				errorCount = 1
+				errTicker.Reset(time.Second * time.Duration(baseErrTime))
+				end = int64(ctl.wsth.TreeSize)
+				// Check for overlap
+				if start >= end {
+					<-errTicker.C // Wait for the next tick.
+					errorCount++
+					errTicker.Reset(time.Second * (time.Duration(baseErrTime) * time.Duration(errorCount)))
+					continue
+				} else {
+					errorCount = 1
+					errTicker.Reset(time.Second * time.Duration(baseErrTime))
+					break
+				}
 			}
 		}
 	}
@@ -281,10 +312,13 @@ func processEntries(results *ct.GetEntriesResponse, start int64) int64 {
 	index := start
 
 	for _, entry := range results.Entries {
+		index++
 		rle, err := ct.RawLogEntryFromLeaf(index, &entry)
 		if err != nil {
-			log.Printf("Failed to get parse entry %d: %v", index, err)
-			return index
+			if verbose {
+				log.Printf("Failed to get parse entry %d: %v", index, err)
+			}
+			break
 		}
 
 		switch entryType := rle.Leaf.TimestampedEntry.EntryType; entryType {
@@ -293,21 +327,20 @@ func processEntries(results *ct.GetEntriesResponse, start int64) int64 {
 		case ct.PrecertLogEntryType:
 			logPrecertInfo(rle)
 		default:
-			log.Println("Unknown entry")
-			return index
+			if verbose {
+				log.Println("Unknown entry")
+			}
 		}
-		index++
 	}
 	return index
 }
 
 func main() {
 	var err error
-	var rootList string
-	var verbose bool
+
 	flag.StringVar(&rootList, "r", "", "Path to the list of root domains to filter against")
 	flag.BoolVar(&verbose, "v", false, "Output go logs (500/429 errors) to command line")
-
+	flag.BoolVar(&debug, "debug", false, "Debug CT logs to see if you are keeping up")
 	flag.Parse()
 
 	if rootList != "" {
