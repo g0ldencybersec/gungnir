@@ -19,14 +19,17 @@ Gungnir is designed to be a lightweight and efficient tool, making it suitable f
 ## Installation
 
 ```sh
-go install github.com/g0ldencybersec/gungnir/gungnir@latest
+go install github.com/g0ldencybersec/gungnir/cmd/gungnir@latest
 ```
 
 ## Usage
 # Options
 ```sh
 Usage of gungnir:
-  -r string Path to the list of root domains to filter against. If this flag is not used then all output is printed.
+  -debug
+        Debug CT logs to see if you are keeping up
+  -r string
+        Path to the list of root domains to filter against
   -v    Output go logs (500/429 errors) to command line
 ```
 
