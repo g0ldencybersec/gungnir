@@ -129,6 +129,10 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 			break
 		}
 	}
+
+	// Is this a google log?
+	IsGoogleLog := strings.Contains(ctl.Name, "Google")
+
 	ticker := time.NewTicker(tickerDuration)
 	defer ticker.Stop()
 
@@ -151,7 +155,7 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 		break
 	}
 
-	start = end - 100
+	start = end - 20
 
 	for {
 		select {
@@ -170,44 +174,65 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 					}
 					continue
 				}
-				continue
-			}
-
-			entries, err := ctl.Client.GetRawEntries(ctx, start, end)
-			if err != nil {
-				if r.options.Verbose {
-					log.Printf("Error fetching entries for %s: %v", ctl.Name, err)
-				}
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(60 * time.Second): // Wait with context awareness
+				if r.options.Debug {
+					if end-start > 25 {
+						fmt.Printf("%s is behind by: %d\n", ctl.Name, end-start)
+					}
 				}
 				continue
 			}
 
-			if len(entries.Entries) > 0 {
-				r.entryTasksChan <- types.EntryTask{
-					Entries: entries,
-					Index:   start,
-				}
-				start += int64(len(entries.Entries))
-			}
+			// Work with google logs
+			if IsGoogleLog {
+				for start < end {
+					batchEnd := start + 32
+					if batchEnd > end {
+						batchEnd = end
+					}
+					entries, err := ctl.Client.GetRawEntries(ctx, start, batchEnd)
+					if err != nil {
+						if r.options.Verbose {
+							log.Printf("Error fetching entries for %s: %v", ctl.Name, err)
+						}
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(30 * time.Second): // Wait with context awareness
+						}
+						break // Break this loop on error, wait for the next ticker tick.
+					}
 
-			if r.options.Debug {
-				if end-start > 1 {
-					fmt.Printf("%s end was: %d but made it to %d --> difference of: %d\n", ctl.Name, end, start, end-start)
+					if len(entries.Entries) > 0 {
+						r.entryTasksChan <- types.EntryTask{
+							Entries: entries,
+							Index:   start,
+						}
+						start += int64(len(entries.Entries))
+					} else {
+						break // No more entries to process, break the loop.
+					}
 				}
-			}
+				continue // Continue with the outer loop.
+			} else { // Non Google handler
+				entries, err := ctl.Client.GetRawEntries(ctx, start, end)
+				if err != nil {
+					if r.options.Verbose {
+						log.Printf("Error fetching entries for %s: %v", ctl.Name, err)
+					}
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(60 * time.Second): // Wait with context awareness
+					}
+					continue
+				}
 
-			if err = r.fetchAndUpdateSTH(ctx, ctl, &end); err != nil {
-				if r.options.Verbose {
-					log.Printf("Failed to update STH after processing entries: %v", err)
-				}
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(60 * time.Second): // Wait with context awareness
+				if len(entries.Entries) > 0 {
+					r.entryTasksChan <- types.EntryTask{
+						Entries: entries,
+						Index:   start,
+					}
+					start += int64(len(entries.Entries))
 				}
 			}
 		}
