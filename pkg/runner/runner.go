@@ -143,7 +143,7 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 	for retries := 0; retries < 3; retries++ {
 		if err = r.fetchAndUpdateSTH(ctx, ctl, &end); err != nil {
 			if r.options.Verbose {
-				log.Printf("Retry %d: Failed to get initial STH for log %s: %v", retries+1, ctl.Client.BaseURI(), err)
+				fmt.Fprintf(os.Stderr, "Retry %d: Failed to get initial STH for log %s: %v\n", retries+1, ctl.Client.BaseURI(), err)
 			}
 			select {
 			case <-ctx.Done():
@@ -165,7 +165,7 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 			if start >= end {
 				if err = r.fetchAndUpdateSTH(ctx, ctl, &end); err != nil {
 					if r.options.Verbose {
-						log.Printf("Failed to update STH: %v", err)
+						fmt.Fprintf(os.Stderr, "Failed to update STH: %v\n", err)
 					}
 					select {
 					case <-ctx.Done():
@@ -176,7 +176,7 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 				}
 				if r.options.Debug {
 					if end-start > 25 {
-						fmt.Printf("%s is behind by: %d\n", ctl.Name, end-start)
+						fmt.Fprintf(os.Stderr, "%s is behind by: %d\n", ctl.Name, end-start)
 					}
 				}
 				continue
@@ -192,7 +192,7 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 					entries, err := ctl.Client.GetRawEntries(ctx, start, batchEnd)
 					if err != nil {
 						if r.options.Verbose {
-							log.Printf("Error fetching entries for %s: %v", ctl.Name, err)
+							fmt.Fprintf(os.Stderr, "Error fetching entries for %s: %v", ctl.Name, err)
 						}
 						select {
 						case <-ctx.Done():
@@ -217,7 +217,7 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 				entries, err := ctl.Client.GetRawEntries(ctx, start, end)
 				if err != nil {
 					if r.options.Verbose {
-						log.Printf("Error fetching entries for %s: %v", ctl.Name, err)
+						fmt.Fprintf(os.Stderr, "Error fetching entries for %s: %v", ctl.Name, err)
 					}
 					select {
 					case <-ctx.Done():
@@ -256,7 +256,7 @@ func (r *Runner) processEntries(results *ct.GetEntriesResponse, start int64) {
 		rle, err := ct.RawLogEntryFromLeaf(index, &entry)
 		if err != nil {
 			if r.options.Verbose {
-				log.Printf("Failed to get parse entry %d: %v", index, err)
+				fmt.Fprintf(os.Stderr, "Failed to get parse entry %d: %v", index, err)
 			}
 			break
 		}
@@ -268,7 +268,7 @@ func (r *Runner) processEntries(results *ct.GetEntriesResponse, start int64) {
 			r.logPrecertInfo(rle)
 		default:
 			if r.options.Verbose {
-				log.Println("Unknown entry")
+				fmt.Fprintln(os.Stderr, "Unknown entry")
 			}
 		}
 	}
