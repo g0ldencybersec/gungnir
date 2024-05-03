@@ -2,6 +2,7 @@ package utils
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/g0ldencybersec/gungnir/pkg/types"
 	"github.com/google/certificate-transparency-go/loglist3"
+	"github.com/google/certificate-transparency-go/x509"
 	"github.com/google/uuid"
 
 	"github.com/google/certificate-transparency-go/client"
@@ -120,4 +122,19 @@ func IsSubdomain(domain string, rootDomains map[string]bool) bool {
 	}
 
 	return false
+}
+
+func JsonOutput(cert *x509.Certificate) {
+	certInfo := types.CertificateInfo{
+		OriginIP:         "",
+		Organization:     cert.Subject.Organization,
+		OrganizationUnit: cert.Subject.OrganizationalUnit,
+		CommonName:       cert.Subject.CommonName,
+		SAN:              cert.DNSNames,
+		Domains:          append([]string{cert.Subject.CommonName}, cert.DNSNames...),
+		Emails:           cert.EmailAddresses,
+		IPAddrs:          cert.IPAddresses,
+	}
+	outputJson, _ := json.Marshal(certInfo)
+	fmt.Println(string(outputJson))
 }

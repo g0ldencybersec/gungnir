@@ -26,11 +26,10 @@ go install github.com/g0ldencybersec/gungnir/cmd/gungnir@latest
 # Options
 ```sh
 Usage of gungnir:
-  -debug
-        Debug CT logs to see if you are keeping up
-  -r string
-        Path to the list of root domains to filter against
-  -v    Output go logs (500/429 errors) to command line
+  -debug    Debug CT logs to see if you are keeping up
+  -r        Path to the list of root domains to filter against
+  -v        Output go logs (500/429 errors) to command line
+  -j        JSONL output cert info
 ```
 
 To run the tool, use a text file of root domains you want to monitor: `roots.txt`. Then, run the `gungnir` module:
