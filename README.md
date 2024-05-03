@@ -26,9 +26,9 @@ go install github.com/g0ldencybersec/gungnir/cmd/gungnir@latest
 # Options
 ```sh
 Usage of gungnir:
-  -debug    Debug CT logs to see if you are keeping up
+  -debug    Debug CT logs to see if you are keeping up. Outputs to STDERR
   -r        Path to the list of root domains to filter against
-  -v        Output go logs (500/429 errors) to command line
+  -v        Output go logs (500/429 errors) to STDERR
   -j        JSONL output cert info
 ```
 
