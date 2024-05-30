@@ -81,7 +81,7 @@ func (r *Runner) Run() {
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-signals
-		fmt.Println("Shutdown signal received")
+		fmt.Fprintf(os.Stderr, "Shutdown signal received")
 		cancel() // Cancel the context
 	}()
 
@@ -102,7 +102,7 @@ func (r *Runner) Run() {
 
 	wg.Wait()               // Wait for all goroutines to finish
 	close(r.entryTasksChan) // Close the channel after all tasks are complete
-	fmt.Println("Gracefully shutdown all routines")
+	fmt.Fprintf(os.Stderr, "Gracefully shutdown all routines")
 }
 
 func (r *Runner) entryWorker(ctx context.Context) {
