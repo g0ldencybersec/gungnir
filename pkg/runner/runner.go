@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/g0ldencybersec/gungnir/pkg/types"
 	"github.com/g0ldencybersec/gungnir/pkg/utils"
 	ct "github.com/google/certificate-transparency-go"
@@ -33,76 +34,141 @@ type Runner struct {
 	options        *Options
 	logClients     []types.CtLog
 	rootDomains    map[string]bool
+	followFile     map[string]bool
 	rateLimitMap   map[string]time.Duration
 	entryTasksChan chan types.EntryTask
+	watcher        *fsnotify.Watcher
+	restartChan    chan struct{}
 }
 
 func NewRunner(options *Options) (*Runner, error) {
-	var err error
-	// Parse Options
-	runner := &Runner{options: options}
-
-	// Load root domains if any
-	runner.rootDomains = map[string]bool{}
-	if runner.options.RootList != "" {
-		file, err := os.Open(runner.options.RootList)
-		if err != nil {
-			panic(err)
-		}
-		defer file.Close()
-
-		scanner := bufio.NewScanner(file)
-		for scanner.Scan() {
-			runner.rootDomains[scanner.Text()] = true
-		}
-
+	runner := &Runner{
+		options:     options,
+		rootDomains: make(map[string]bool),
+		restartChan: make(chan struct{}),
 	}
 
-	// Collect CT Logs
+	if err := runner.loadRootDomains(); err != nil {
+		return nil, fmt.Errorf("failed to load root domains: %v", err)
+	}
+
+	if runner.options.WatchFile {
+		if err := runner.setupFileWatcher(); err != nil {
+			return nil, fmt.Errorf("failed to setup file watcher: %v", err)
+		}
+	}
+
+	var err error
 	runner.logClients, err = utils.PopulateLogs(logListUrl)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("failed to populate logs: %v", err)
 	}
 
 	runner.entryTasksChan = make(chan types.EntryTask, len(runner.logClients)*100)
-
-	// Copy rate limit map
 	runner.rateLimitMap = defaultRateLimitMap
 
 	return runner, nil
+}
+
+func (r *Runner) loadRootDomains() error {
+	if r.options.RootList == "" {
+		return nil
+	}
+
+	file, err := os.Open(r.options.RootList)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	r.rootDomains = make(map[string]bool)
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		r.rootDomains[scanner.Text()] = true
+	}
+
+	return scanner.Err()
+}
+
+func (r *Runner) setupFileWatcher() error {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return err
+	}
+
+	r.watcher = watcher
+
+	go func() {
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+				if event.Op&fsnotify.Write == fsnotify.Write {
+					if err := r.loadRootDomains(); err != nil {
+						log.Printf("Error reloading domains: %v", err)
+					}
+					r.restartChan <- struct{}{}
+				}
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				log.Printf("Watcher error: %v", err)
+			}
+		}
+	}()
+
+	return watcher.Add(r.options.RootList)
 }
 
 func (r *Runner) Run() {
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Setup signal handling
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+
 	go func() {
-		<-signals
-		fmt.Fprintf(os.Stderr, "Shutdown signal received")
-		cancel() // Cancel the context
+		for {
+			select {
+			case <-signals:
+				fmt.Fprintf(os.Stderr, "Shutdown signal received")
+				cancel()
+				return
+			case <-r.restartChan:
+				fmt.Fprintf(os.Stderr, "Restarting scan due to file update")
+				cancel()
+				ctx, cancel = context.WithCancel(context.Background())
+				go r.startScan(ctx, &wg)
+			}
+		}
 	}()
 
-	// Parsing results workers
+	r.startScan(ctx, &wg)
+
+	wg.Wait()
+	close(r.entryTasksChan)
+	if r.watcher != nil {
+		r.watcher.Close()
+	}
+	fmt.Fprintf(os.Stderr, "Gracefully shutdown all routines")
+}
+
+func (r *Runner) startScan(ctx context.Context, wg *sync.WaitGroup) {
 	for i := 0; i < len(r.logClients); i++ {
-		wg.Add(1) // Don't forget to add to the WaitGroup for each worker
+		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			r.entryWorker(ctx)
 		}()
 	}
 
-	// Start scanning logs
 	for _, ctl := range r.logClients {
 		wg.Add(1)
-		go r.scanLog(ctx, ctl, &wg)
+		go r.scanLog(ctx, ctl, wg)
 	}
-
-	wg.Wait()               // Wait for all goroutines to finish
-	close(r.entryTasksChan) // Close the channel after all tasks are complete
-	fmt.Fprintf(os.Stderr, "Gracefully shutdown all routines")
 }
 
 func (r *Runner) entryWorker(ctx context.Context) {
@@ -314,8 +380,6 @@ func (r *Runner) logCertInfo(entry *ct.RawLogEntry) {
 	}
 }
 
-// Prints out a short bit of info about |precert|, found at |index| in the
-// specified log
 func (r *Runner) logPrecertInfo(entry *ct.RawLogEntry) {
 	parsedEntry, err := entry.ToLogEntry()
 	if x509.IsFatal(err) || parsedEntry.Precert == nil {
