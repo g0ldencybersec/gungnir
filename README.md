@@ -26,22 +26,39 @@ go install github.com/g0ldencybersec/gungnir/cmd/gungnir@latest
 # Options
 ```sh
 Usage of gungnir:
-  -debug    Debug CT logs to see if you are keeping up. Outputs to STDERR
-  -r        Path to the list of root domains to filter against
-  -f        Option to have Gungnir watch the roots file for updates and add them to the scan
-  -v        Output go logs (500/429 errors) to STDERR
-  -j        JSONL output cert info
+  -debug
+        Debug CT logs to see if you are keeping up
+  -f    Monitor the root domain file for updates and add the new roots to the scan
+  -j    JSONL output cert info
+  -output-separate-file
+        Save output in separate files based on root domain
+  -r string
+        Path to the list of root domains to filter against
+  -v    Output go logs (500/429 errors) to command line
 ```
 
 To run the tool, use a text file of root domains you want to monitor: `roots.txt`. Then, run the `gungnir` module:
 
 ```sh
-./gungnir -r roots.txt (filtered)
+gungnir -r roots.txt (filtered)
 - or -
-./gungnir -r roots.txt -f (filtered and following)
+gungnir -r roots.txt -f (filtered and following)
 - or -
-./gungnir (unfiltered)
+gungnir (unfiltered)
 
+```
+
+## Usage Example of `-output-separate-file`
+You can create your own bug bounty subdomains database like this https://github.com/rix4uni/BugBountyData, https://bugbountydata.netlify.app
+```
+#cat roots.txt
+microsoft.com
+zendesk.com
+
+#gungnir -r roots.txt -output-separate-file
+gungnir
+├── microsoft.com.txt
+└── zendesk.com.txt
 ```
 
 Once the tool starts and initializes, it will print domains to stdout. So feel free to pipe the output into your favorite tool!
