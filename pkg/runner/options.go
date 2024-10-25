@@ -3,11 +3,12 @@ package runner
 import "flag"
 
 type Options struct {
-	Verbose    bool
-	RootList   string
-	Debug      bool
-	JsonOutput bool
-	WatchFile  bool
+	Verbose            bool
+	RootList           string
+	Debug              bool
+	JsonOutput         bool
+	WatchFile          bool
+	OutputSeparateFile bool
 }
 
 func ParseOptions() *Options {
@@ -18,6 +19,7 @@ func ParseOptions() *Options {
 	flag.BoolVar(&options.Verbose, "v", false, "Output go logs (500/429 errors) to command line")
 	flag.BoolVar(&options.Debug, "debug", false, "Debug CT logs to see if you are keeping up")
 	flag.BoolVar(&options.JsonOutput, "j", false, "JSONL output cert info")
+	flag.BoolVar(&options.OutputSeparateFile, "output-separate-file", false, "Save output in separate files based on root domain")
 	flag.Parse()
 
 	return options

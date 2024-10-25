@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -134,7 +135,7 @@ func (r *Runner) Run() {
 		for {
 			select {
 			case <-signals:
-				fmt.Fprintf(os.Stderr, "Shutdown signal received")
+				fmt.Fprintln(os.Stderr, "Shutdown signal received")
 				cancel()
 				return
 			case <-r.restartChan:
@@ -153,7 +154,7 @@ func (r *Runner) Run() {
 	if r.watcher != nil {
 		r.watcher.Close()
 	}
-	fmt.Fprintf(os.Stderr, "Gracefully shutdown all routines")
+	fmt.Fprintln(os.Stderr, "Gracefully shutdown all routines")
 }
 
 func (r *Runner) startScan(ctx context.Context, wg *sync.WaitGroup) {
@@ -345,6 +346,8 @@ func (r *Runner) logCertInfo(entry *ct.RawLogEntry) {
 	if x509.IsFatal(err) || parsedEntry.X509Cert == nil {
 		log.Printf("Process cert at index %d: <unparsed: %v>", entry.Index, err)
 	} else {
+		rootDomain := utils.GetRootDomain(parsedEntry.X509Cert.Subject.CommonName, r.rootDomains)
+
 		if len(r.rootDomains) == 0 {
 			if r.options.JsonOutput {
 				utils.JsonOutput(parsedEntry.X509Cert)
@@ -369,10 +372,16 @@ func (r *Runner) logCertInfo(entry *ct.RawLogEntry) {
 			} else {
 				if utils.IsSubdomain(parsedEntry.X509Cert.Subject.CommonName, r.rootDomains) {
 					fmt.Println(parsedEntry.X509Cert.Subject.CommonName)
+					if r.options.OutputSeparateFile {
+						r.writeToFile(rootDomain, parsedEntry.X509Cert.Subject.CommonName)
+					}
 				}
 				for _, domain := range parsedEntry.X509Cert.DNSNames {
 					if utils.IsSubdomain(domain, r.rootDomains) {
 						fmt.Println(domain)
+						if r.options.OutputSeparateFile {
+							r.writeToFile(rootDomain, domain)
+						}
 					}
 				}
 			}
@@ -385,6 +394,8 @@ func (r *Runner) logPrecertInfo(entry *ct.RawLogEntry) {
 	if x509.IsFatal(err) || parsedEntry.Precert == nil {
 		log.Printf("Process precert at index %d: <unparsed: %v>", entry.Index, err)
 	} else {
+		rootDomain := utils.GetRootDomain(parsedEntry.Precert.TBSCertificate.Subject.CommonName, r.rootDomains)
+
 		if len(r.rootDomains) == 0 {
 			if r.options.JsonOutput {
 				utils.JsonOutput(parsedEntry.Precert.TBSCertificate)
@@ -409,13 +420,52 @@ func (r *Runner) logPrecertInfo(entry *ct.RawLogEntry) {
 			} else {
 				if utils.IsSubdomain(parsedEntry.Precert.TBSCertificate.Subject.CommonName, r.rootDomains) {
 					fmt.Println(parsedEntry.Precert.TBSCertificate.Subject.CommonName)
+					if r.options.OutputSeparateFile {
+						r.writeToFile(rootDomain, parsedEntry.Precert.TBSCertificate.Subject.CommonName)
+					}
 				}
 				for _, domain := range parsedEntry.Precert.TBSCertificate.DNSNames {
 					if utils.IsSubdomain(domain, r.rootDomains) {
 						fmt.Println(domain)
+						if r.options.OutputSeparateFile {
+							r.writeToFile(rootDomain, domain)
+						}
 					}
 				}
 			}
 		}
 	}
+}
+
+func (r *Runner) writeToFile(rootDomain string, name string) {
+	// Ensure rootDomain is not empty
+	if rootDomain == "" {
+		rootDomain = "unknown"
+	}
+
+	// Define the directory to save the results
+	outputDir := "gungnir/"
+
+	// Ensure the directory exists
+	if err := os.MkdirAll(outputDir, os.ModePerm); err != nil {
+		log.Printf("Failed to create directory %s: %v", outputDir, err)
+		return
+	}
+
+	// Define the file path in the 'results' directory
+	filePath := filepath.Join(outputDir, rootDomain+".txt")
+
+	// Open the file in append mode, create if it doesn't exist
+	file, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("Failed to open file for root domain %s: %v", rootDomain, err)
+		return
+	}
+	defer file.Close()
+
+	// Use bufio for efficient writing
+	writer := bufio.NewWriter(file)
+	defer writer.Flush()
+
+	fmt.Fprintln(writer, name)
 }

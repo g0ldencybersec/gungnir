@@ -21,6 +21,17 @@ import (
 	"github.com/google/certificate-transparency-go/jsonclient"
 )
 
+// GetRootDomain extracts the root domain from a full domain name
+func GetRootDomain(domain string, rootDomains map[string]bool) string {
+	for root := range rootDomains {
+		if strings.HasSuffix(domain, root) {
+			return root
+		}
+	}
+	// Return the domain itself if no match is found
+	return domain
+}
+
 var getByScheme = map[string]func(*url.URL) ([]byte, error){
 	"http":  readHTTP,
 	"https": readHTTP,
