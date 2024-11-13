@@ -3,10 +3,15 @@ package runner
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
+	"github.com/g0ldencybersec/gungnir/pkg/utils"
+	ct "github.com/google/certificate-transparency-go"
+	"github.com/google/certificate-transparency-go/x509"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -14,11 +19,9 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/g0ldencybersec/gungnir/pkg/types"
-	"github.com/g0ldencybersec/gungnir/pkg/utils"
-	ct "github.com/google/certificate-transparency-go"
-	"github.com/google/certificate-transparency-go/x509"
 )
 
+// Global variables
 var (
 	logListUrl          = "https://www.gstatic.com/ct/log_list/v3/all_logs_list.json"
 	defaultRateLimitMap = map[string]time.Duration{
@@ -39,35 +42,7 @@ type Runner struct {
 	entryTasksChan chan types.EntryTask
 	watcher        *fsnotify.Watcher
 	restartChan    chan struct{}
-}
-
-func NewRunner(options *Options) (*Runner, error) {
-	runner := &Runner{
-		options:     options,
-		rootDomains: make(map[string]bool),
-		restartChan: make(chan struct{}),
-	}
-
-	if err := runner.loadRootDomains(); err != nil {
-		return nil, fmt.Errorf("failed to load root domains: %v", err)
-	}
-
-	if runner.options.WatchFile {
-		if err := runner.setupFileWatcher(); err != nil {
-			return nil, fmt.Errorf("failed to setup file watcher: %v", err)
-		}
-	}
-
-	var err error
-	runner.logClients, err = utils.PopulateLogs(logListUrl)
-	if err != nil {
-		return nil, fmt.Errorf("failed to populate logs: %v", err)
-	}
-
-	runner.entryTasksChan = make(chan types.EntryTask, len(runner.logClients)*100)
-	runner.rateLimitMap = defaultRateLimitMap
-
-	return runner, nil
+	outputMutex    sync.Mutex
 }
 
 func (r *Runner) loadRootDomains() error {
@@ -77,7 +52,7 @@ func (r *Runner) loadRootDomains() error {
 
 	file, err := os.Open(r.options.RootList)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to open root domains file: %v", err)
 	}
 	defer file.Close()
 
@@ -87,7 +62,11 @@ func (r *Runner) loadRootDomains() error {
 		r.rootDomains[scanner.Text()] = true
 	}
 
-	return scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error reading root domains file: %v", err)
+	}
+
+	return nil
 }
 
 func (r *Runner) setupFileWatcher() error {
@@ -108,6 +87,7 @@ func (r *Runner) setupFileWatcher() error {
 				if event.Op&fsnotify.Write == fsnotify.Write {
 					if err := r.loadRootDomains(); err != nil {
 						log.Printf("Error reloading domains: %v", err)
+						continue
 					}
 					r.restartChan <- struct{}{}
 				}
@@ -123,6 +103,39 @@ func (r *Runner) setupFileWatcher() error {
 	return watcher.Add(r.options.RootList)
 }
 
+func NewRunner(options *Options) (*Runner, error) {
+	runner := &Runner{
+		options:     options,
+		rootDomains: make(map[string]bool),
+		restartChan: make(chan struct{}),
+	}
+
+	if err := runner.loadRootDomains(); err != nil {
+		return nil, fmt.Errorf("failed to load root domains: %v", err)
+	}
+
+	// Verify that we have root domains if output directory is specified
+	if runner.options.OutputDir != "" && len(runner.rootDomains) == 0 {
+		return nil, fmt.Errorf("output directory specified but no root domains loaded")
+	}
+
+	if runner.options.WatchFile {
+		if err := runner.setupFileWatcher(); err != nil {
+			return nil, fmt.Errorf("failed to setup file watcher: %v", err)
+		}
+	}
+
+	var err error
+	runner.logClients, err = utils.PopulateLogs(logListUrl)
+	if err != nil {
+		return nil, fmt.Errorf("failed to populate logs: %v", err)
+	}
+
+	runner.entryTasksChan = make(chan types.EntryTask, len(runner.logClients)*100)
+	runner.rateLimitMap = defaultRateLimitMap
+
+	return runner, nil
+}
 func (r *Runner) Run() {
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithCancel(context.Background())
@@ -134,11 +147,11 @@ func (r *Runner) Run() {
 		for {
 			select {
 			case <-signals:
-				fmt.Fprintf(os.Stderr, "Shutdown signal received")
+				fmt.Fprintf(os.Stderr, "Shutdown signal received\n")
 				cancel()
 				return
 			case <-r.restartChan:
-				fmt.Fprintf(os.Stderr, "Restarting scan due to file update")
+				fmt.Fprintf(os.Stderr, "Restarting scan due to file update\n")
 				cancel()
 				ctx, cancel = context.WithCancel(context.Background())
 				go r.startScan(ctx, &wg)
@@ -153,10 +166,11 @@ func (r *Runner) Run() {
 	if r.watcher != nil {
 		r.watcher.Close()
 	}
-	fmt.Fprintf(os.Stderr, "Gracefully shutdown all routines")
+	fmt.Fprintf(os.Stderr, "Gracefully shutdown all routines\n")
 }
 
 func (r *Runner) startScan(ctx context.Context, wg *sync.WaitGroup) {
+	// Start entry workers
 	for i := 0; i < len(r.logClients); i++ {
 		wg.Add(1)
 		go func() {
@@ -165,6 +179,7 @@ func (r *Runner) startScan(ctx context.Context, wg *sync.WaitGroup) {
 		}()
 	}
 
+	// Start scanning logs
 	for _, ctl := range r.logClients {
 		wg.Add(1)
 		go r.scanLog(ctx, ctl, wg)
@@ -304,7 +319,6 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 		}
 	}
 }
-
 func (r *Runner) fetchAndUpdateSTH(ctx context.Context, ctl types.CtLog, end *int64) error {
 	wsth, err := ctl.Client.GetSTH(ctx)
 	if err != nil {
@@ -340,11 +354,113 @@ func (r *Runner) processEntries(results *ct.GetEntriesResponse, start int64) {
 	}
 }
 
+func (r *Runner) writeToHostFile(hostname string, data interface{}) error {
+	// Early return if no output directory specified or if root domains is empty
+	if r.options.OutputDir == "" || len(r.rootDomains) == 0 {
+		return nil
+	}
+
+	// Find matching root domain
+	var matchingRoot string
+	for root := range r.rootDomains {
+		if utils.IsSubdomain(hostname, map[string]bool{root: true}) {
+			matchingRoot = root
+			break
+		}
+	}
+
+	// If no matching root domain found, return
+	if matchingRoot == "" {
+		return nil
+	}
+
+	// Create output directory if it doesn't exist
+	if err := os.MkdirAll(r.options.OutputDir, 0755); err != nil {
+		return fmt.Errorf("failed to create output directory: %v", err)
+	}
+
+	// Sanitize root domain for filename
+	safeRootDomain := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r
+		case r >= '0' && r <= '9':
+			return r
+		case r == '.' || r == '-' || r == '_':
+			return r
+		default:
+			return '_'
+		}
+	}, matchingRoot)
+
+	filePath := filepath.Join(r.options.OutputDir, safeRootDomain+".txt")
+
+	// Use mutex to prevent concurrent file access
+	r.outputMutex.Lock()
+	defer r.outputMutex.Unlock()
+
+	// Open file in append mode
+	f, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open output file: %v", err)
+	}
+	defer f.Close()
+
+	var output string
+	if r.options.JsonOutput {
+		jsonData, err := json.Marshal(struct {
+			Hostname string      `json:"hostname"`
+			Data     interface{} `json:"data"`
+		}{
+			Hostname: hostname,
+			Data:     data,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to marshal JSON: %v", err)
+		}
+		output = string(jsonData) + "\n"
+	} else {
+		// output = fmt.Sprintf("Hostname: %s\nData: %v\n---\n", hostname, data)
+		output = fmt.Sprintf("Hostname: %s\n", hostname)
+	}
+
+	if _, err := f.WriteString(output); err != nil {
+		return fmt.Errorf("failed to write to file: %v", err)
+	}
+
+	return nil
+}
+
 func (r *Runner) logCertInfo(entry *ct.RawLogEntry) {
 	parsedEntry, err := entry.ToLogEntry()
 	if x509.IsFatal(err) || parsedEntry.X509Cert == nil {
 		log.Printf("Process cert at index %d: <unparsed: %v>", entry.Index, err)
+		return
+	}
+
+	// Only process if we have root domains and output directory
+	if r.options.OutputDir != "" && len(r.rootDomains) > 0 {
+		// Handle CommonName
+		if parsedEntry.X509Cert.Subject.CommonName != "" {
+			if err := r.writeToHostFile(parsedEntry.X509Cert.Subject.CommonName, parsedEntry.X509Cert); err != nil {
+				if r.options.Verbose {
+					log.Printf("Error writing to file for %s: %v", parsedEntry.X509Cert.Subject.CommonName, err)
+				}
+			}
+		}
+
+		// Handle DNS names
+		for _, domain := range parsedEntry.X509Cert.DNSNames {
+			if err := r.writeToHostFile(domain, parsedEntry.X509Cert); err != nil {
+				if r.options.Verbose {
+					log.Printf("Error writing to file for %s: %v", domain, err)
+				}
+			}
+		}
 	} else {
+		// Original stdout output behavior
 		if len(r.rootDomains) == 0 {
 			if r.options.JsonOutput {
 				utils.JsonOutput(parsedEntry.X509Cert)
@@ -355,23 +471,18 @@ func (r *Runner) logCertInfo(entry *ct.RawLogEntry) {
 				}
 			}
 		} else {
-			if r.options.JsonOutput {
-				if utils.IsSubdomain(parsedEntry.X509Cert.Subject.CommonName, r.rootDomains) {
+			if utils.IsSubdomain(parsedEntry.X509Cert.Subject.CommonName, r.rootDomains) {
+				if r.options.JsonOutput {
 					utils.JsonOutput(parsedEntry.X509Cert)
-					return
-				}
-				for _, domain := range parsedEntry.X509Cert.DNSNames {
-					if utils.IsSubdomain(domain, r.rootDomains) {
-						utils.JsonOutput(parsedEntry.X509Cert)
-						break
-					}
-				}
-			} else {
-				if utils.IsSubdomain(parsedEntry.X509Cert.Subject.CommonName, r.rootDomains) {
+				} else {
 					fmt.Println(parsedEntry.X509Cert.Subject.CommonName)
 				}
-				for _, domain := range parsedEntry.X509Cert.DNSNames {
-					if utils.IsSubdomain(domain, r.rootDomains) {
+			}
+			for _, domain := range parsedEntry.X509Cert.DNSNames {
+				if utils.IsSubdomain(domain, r.rootDomains) {
+					if r.options.JsonOutput {
+						utils.JsonOutput(parsedEntry.X509Cert)
+					} else {
 						fmt.Println(domain)
 					}
 				}
@@ -384,7 +495,30 @@ func (r *Runner) logPrecertInfo(entry *ct.RawLogEntry) {
 	parsedEntry, err := entry.ToLogEntry()
 	if x509.IsFatal(err) || parsedEntry.Precert == nil {
 		log.Printf("Process precert at index %d: <unparsed: %v>", entry.Index, err)
+		return
+	}
+
+	// Only process if we have root domains and output directory
+	if r.options.OutputDir != "" && len(r.rootDomains) > 0 {
+		// Handle CommonName
+		if parsedEntry.Precert.TBSCertificate.Subject.CommonName != "" {
+			if err := r.writeToHostFile(parsedEntry.Precert.TBSCertificate.Subject.CommonName, parsedEntry.Precert.TBSCertificate); err != nil {
+				if r.options.Verbose {
+					log.Printf("Error writing to file for %s: %v", parsedEntry.Precert.TBSCertificate.Subject.CommonName, err)
+				}
+			}
+		}
+
+		// Handle DNS names
+		for _, domain := range parsedEntry.Precert.TBSCertificate.DNSNames {
+			if err := r.writeToHostFile(domain, parsedEntry.Precert.TBSCertificate); err != nil {
+				if r.options.Verbose {
+					log.Printf("Error writing to file for %s: %v", domain, err)
+				}
+			}
+		}
 	} else {
+		// Original stdout output behavior
 		if len(r.rootDomains) == 0 {
 			if r.options.JsonOutput {
 				utils.JsonOutput(parsedEntry.Precert.TBSCertificate)
@@ -395,23 +529,18 @@ func (r *Runner) logPrecertInfo(entry *ct.RawLogEntry) {
 				}
 			}
 		} else {
-			if r.options.JsonOutput {
-				if utils.IsSubdomain(parsedEntry.Precert.TBSCertificate.Subject.CommonName, r.rootDomains) {
+			if utils.IsSubdomain(parsedEntry.Precert.TBSCertificate.Subject.CommonName, r.rootDomains) {
+				if r.options.JsonOutput {
 					utils.JsonOutput(parsedEntry.Precert.TBSCertificate)
-					return
-				}
-				for _, domain := range parsedEntry.Precert.TBSCertificate.DNSNames {
-					if utils.IsSubdomain(domain, r.rootDomains) {
-						utils.JsonOutput(parsedEntry.Precert.TBSCertificate)
-						break
-					}
-				}
-			} else {
-				if utils.IsSubdomain(parsedEntry.Precert.TBSCertificate.Subject.CommonName, r.rootDomains) {
+				} else {
 					fmt.Println(parsedEntry.Precert.TBSCertificate.Subject.CommonName)
 				}
-				for _, domain := range parsedEntry.Precert.TBSCertificate.DNSNames {
-					if utils.IsSubdomain(domain, r.rootDomains) {
+			}
+			for _, domain := range parsedEntry.Precert.TBSCertificate.DNSNames {
+				if utils.IsSubdomain(domain, r.rootDomains) {
+					if r.options.JsonOutput {
+						utils.JsonOutput(parsedEntry.Precert.TBSCertificate)
+					} else {
 						fmt.Println(domain)
 					}
 				}
