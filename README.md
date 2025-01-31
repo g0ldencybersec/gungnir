@@ -26,11 +26,15 @@ go install github.com/g0ldencybersec/gungnir/cmd/gungnir@latest
 # Options
 ```sh
 Usage of gungnir:
-  -debug    Debug CT logs to see if you are keeping up. Outputs to STDERR
-  -r        Path to the list of root domains to filter against
-  -f        Option to have Gungnir watch the roots file for updates and add them to the scan
-  -v        Output go logs (500/429 errors) to STDERR
-  -j        JSONL output cert info
+  -debug  Debug CT logs to see if you are keeping up
+  -f      Monitor the root domain file for updates and restart the scan. requires the -r flag
+  -j      JSONL output cert info
+  -nc     NATs subject to publish domains to
+  -ns     NATs subject to publish domains to
+  -nu     NATs URL to publish domains to
+  -o      Directory to store output files (one per hostname, requires -r flag)
+  -r      Path to the list of root domains to filter against
+  -v      Output go logs (500/429 errors) to command line
 ```
 
 To run the tool, use a text file of root domains you want to monitor: `roots.txt`. Then, run the `gungnir` module:
