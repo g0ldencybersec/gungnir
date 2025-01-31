@@ -6,12 +6,15 @@ import (
 )
 
 type Options struct {
-	Verbose    bool
-	RootList   string
-	Debug      bool
-	JsonOutput bool
-	WatchFile  bool
-	OutputDir  string
+	Verbose      bool
+	RootList     string
+	Debug        bool
+	JsonOutput   bool
+	WatchFile    bool
+	OutputDir    string
+	NatsSubject  string
+	NatsUrl      string
+	NatsCredFile string
 }
 
 func ParseOptions() (*Options, error) {
@@ -23,6 +26,9 @@ func ParseOptions() (*Options, error) {
 	flag.BoolVar(&options.Debug, "debug", false, "Debug CT logs to see if you are keeping up")
 	flag.BoolVar(&options.JsonOutput, "j", false, "JSONL output cert info")
 	flag.StringVar(&options.OutputDir, "o", "", "Directory to store output files (one per hostname, requires -r flag)")
+	flag.StringVar(&options.NatsSubject, "ns", "", "NATs subject to publish domains to")
+	flag.StringVar(&options.NatsUrl, "nu", "", "NATs URL to publish domains to")
+	flag.StringVar(&options.NatsCredFile, "nc", "", "NATs subject to publish domains to")
 	flag.Parse()
 
 	// Validate that output directory is only used with root list

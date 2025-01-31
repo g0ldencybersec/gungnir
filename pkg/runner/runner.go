@@ -5,9 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/g0ldencybersec/gungnir/pkg/utils"
-	ct "github.com/google/certificate-transparency-go"
-	"github.com/google/certificate-transparency-go/x509"
 	"log"
 	"os"
 	"os/signal"
@@ -16,6 +13,11 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/g0ldencybersec/gungnir/pkg/utils"
+	ct "github.com/google/certificate-transparency-go"
+	"github.com/google/certificate-transparency-go/x509"
+	"github.com/nats-io/nats.go"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/g0ldencybersec/gungnir/pkg/types"
@@ -34,15 +36,17 @@ var (
 )
 
 type Runner struct {
-	options        *Options
-	logClients     []types.CtLog
-	rootDomains    map[string]bool
-	followFile     map[string]bool
+	options     *Options
+	logClients  []types.CtLog
+	rootDomains map[string]bool
+	// followFile     map[string]bool
 	rateLimitMap   map[string]time.Duration
 	entryTasksChan chan types.EntryTask
 	watcher        *fsnotify.Watcher
 	restartChan    chan struct{}
 	outputMutex    sync.Mutex
+	natsPub        bool
+	natsConn       *nats.Conn
 }
 
 func (r *Runner) loadRootDomains() error {
@@ -131,6 +135,20 @@ func NewRunner(options *Options) (*Runner, error) {
 		return nil, fmt.Errorf("failed to populate logs: %v", err)
 	}
 
+	// NATS setup if needed
+	if runner.options.NatsSubject != "" && runner.options.NatsUrl != "" && runner.options.NatsCredFile != "" {
+		nc, err := nats.Connect(runner.options.NatsUrl, nats.UserCredentials(runner.options.NatsCredFile))
+		if err != nil {
+			return nil, fmt.Errorf("failed to make nats connectoin: %v", err)
+		}
+
+		runner.natsConn = nc
+		runner.natsPub = true
+	} else {
+		runner.natsConn = nil
+		runner.natsPub = false
+	}
+
 	runner.entryTasksChan = make(chan types.EntryTask, len(runner.logClients)*100)
 	runner.rateLimitMap = defaultRateLimitMap
 
@@ -166,6 +184,7 @@ func (r *Runner) Run() {
 	if r.watcher != nil {
 		r.watcher.Close()
 	}
+	r.natsConn.Close()
 	fmt.Fprintf(os.Stderr, "Gracefully shutdown all routines\n")
 }
 
@@ -459,6 +478,21 @@ func (r *Runner) logCertInfo(entry *ct.RawLogEntry) {
 				}
 			}
 		}
+	} else if r.natsPub {
+		if utils.IsSubdomain(parsedEntry.X509Cert.Subject.CommonName, r.rootDomains) {
+			err := r.natsConn.Publish(r.options.NatsSubject, []byte(parsedEntry.X509Cert.Subject.CommonName))
+			if err != nil {
+				log.Printf("Error writing to NATs: %v", err)
+			}
+		}
+		for _, domain := range parsedEntry.X509Cert.DNSNames {
+			if utils.IsSubdomain(domain, r.rootDomains) {
+				err := r.natsConn.Publish(r.options.NatsSubject, []byte(domain))
+				if err != nil {
+					log.Printf("Error writing to NATs: %v", err)
+				}
+			}
+		}
 	} else {
 		// Original stdout output behavior
 		if len(r.rootDomains) == 0 {
@@ -514,6 +548,21 @@ func (r *Runner) logPrecertInfo(entry *ct.RawLogEntry) {
 			if err := r.writeToHostFile(domain, parsedEntry.Precert.TBSCertificate); err != nil {
 				if r.options.Verbose {
 					log.Printf("Error writing to file for %s: %v", domain, err)
+				}
+			}
+		}
+	} else if r.natsPub {
+		if utils.IsSubdomain(parsedEntry.Precert.TBSCertificate.Subject.CommonName, r.rootDomains) {
+			err := r.natsConn.Publish(r.options.NatsSubject, []byte(parsedEntry.Precert.TBSCertificate.Subject.CommonName))
+			if err != nil {
+				log.Printf("Error writing to NATs: %v", err)
+			}
+		}
+		for _, domain := range parsedEntry.Precert.TBSCertificate.DNSNames {
+			if utils.IsSubdomain(domain, r.rootDomains) {
+				err := r.natsConn.Publish(r.options.NatsSubject, []byte(domain))
+				if err != nil {
+					log.Printf("Error writing to NATs: %v", err)
 				}
 			}
 		}
