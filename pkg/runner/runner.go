@@ -156,9 +156,16 @@ func NewRunner(options *Options) (*Runner, error) {
 	if runner.options.ActorPID != nil {
 		runner.useActor = true
 		runner.actorPID = runner.options.ActorPID
-		runner.actorEngine, err = actor.NewEngine(actor.EngineConfig{})
-		if err != nil {
-			return nil, fmt.Errorf("failed to create actor engine: %v", err)
+
+		if runner.options.ActorEngine != nil {
+			runner.actorEngine = runner.options.ActorEngine
+		} else {
+			log.Println("No actor engine provided, creating a new one")
+			// Fall back to creating a new engine if none is provided
+			runner.actorEngine, err = actor.NewEngine(actor.EngineConfig{})
+			if err != nil {
+				return nil, fmt.Errorf("failed to create actor engine: %v", err)
+			}
 		}
 	}
 

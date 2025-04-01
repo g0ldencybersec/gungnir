@@ -18,6 +18,7 @@ type Options struct {
 	NatsUrl      string
 	NatsCredFile string
 	ActorPID     *actor.PID
+	ActorEngine  *actor.Engine
 }
 
 func ParseOptions() (*Options, error) {
