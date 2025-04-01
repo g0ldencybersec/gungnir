@@ -3,6 +3,8 @@ package runner
 import (
 	"flag"
 	"fmt"
+
+	"github.com/anthdm/hollywood/actor"
 )
 
 type Options struct {
@@ -15,6 +17,7 @@ type Options struct {
 	NatsSubject  string
 	NatsUrl      string
 	NatsCredFile string
+	ActorPID     *actor.PID
 }
 
 func ParseOptions() (*Options, error) {

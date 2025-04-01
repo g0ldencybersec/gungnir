@@ -31,3 +31,7 @@ type CertificateInfo struct {
 	Emails           []string `json:"emails"`
 	IPAddrs          []net.IP `json:"ips"`
 }
+
+type GungnirMessage struct {
+	Domain string
+}

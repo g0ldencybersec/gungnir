@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/anthdm/hollywood/actor"
 	"github.com/g0ldencybersec/gungnir/pkg/utils"
 	ct "github.com/google/certificate-transparency-go"
 	"github.com/google/certificate-transparency-go/x509"
@@ -47,6 +48,9 @@ type Runner struct {
 	outputMutex    sync.Mutex
 	natsPub        bool
 	natsConn       *nats.Conn
+	actorPID       *actor.PID
+	useActor       bool
+	actorEngine    *actor.Engine
 }
 
 func (r *Runner) loadRootDomains() error {
@@ -147,6 +151,15 @@ func NewRunner(options *Options) (*Runner, error) {
 	} else {
 		runner.natsConn = nil
 		runner.natsPub = false
+	}
+
+	if runner.options.ActorPID != nil {
+		runner.useActor = true
+		runner.actorPID = runner.options.ActorPID
+		runner.actorEngine, err = actor.NewEngine(actor.EngineConfig{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create actor engine: %v", err)
+		}
 	}
 
 	runner.entryTasksChan = make(chan types.EntryTask, len(runner.logClients)*100)
@@ -478,6 +491,15 @@ func (r *Runner) logCertInfo(entry *ct.RawLogEntry) {
 				}
 			}
 		}
+	} else if r.useActor {
+		if utils.IsSubdomain(parsedEntry.X509Cert.Subject.CommonName, r.rootDomains) {
+			r.actorEngine.Send(r.actorPID, &types.GungnirMessage{Domain: parsedEntry.X509Cert.Subject.CommonName})
+		}
+		for _, domain := range parsedEntry.X509Cert.DNSNames {
+			if utils.IsSubdomain(domain, r.rootDomains) {
+				r.actorEngine.Send(r.actorPID, &types.GungnirMessage{Domain: domain})
+			}
+		}
 	} else if r.natsPub {
 		if utils.IsSubdomain(parsedEntry.X509Cert.Subject.CommonName, r.rootDomains) {
 			err := r.natsConn.Publish(r.options.NatsSubject, []byte(parsedEntry.X509Cert.Subject.CommonName))
@@ -549,6 +571,15 @@ func (r *Runner) logPrecertInfo(entry *ct.RawLogEntry) {
 				if r.options.Verbose {
 					log.Printf("Error writing to file for %s: %v", domain, err)
 				}
+			}
+		}
+	} else if r.useActor {
+		if utils.IsSubdomain(parsedEntry.Precert.TBSCertificate.Subject.CommonName, r.rootDomains) {
+			r.actorEngine.Send(r.actorPID, &types.GungnirMessage{Domain: parsedEntry.Precert.TBSCertificate.Subject.CommonName})
+		}
+		for _, domain := range parsedEntry.Precert.TBSCertificate.DNSNames {
+			if utils.IsSubdomain(domain, r.rootDomains) {
+				r.actorEngine.Send(r.actorPID, &types.GungnirMessage{Domain: domain})
 			}
 		}
 	} else if r.natsPub {
