@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
@@ -49,24 +50,35 @@ func readURL(u *url.URL) ([]byte, error) {
 }
 
 // createLogClient creates a CT log client from a public key and URL.
+// FIXED: Only adds HTTP/2 deadlock prevention while preserving all original settings
 func createLogClient(key []byte, url string) (*client.LogClient, error) {
 	pemPK := pem.EncodeToMemory(&pem.Block{
 		Type:  "PUBLIC KEY",
 		Bytes: key,
 	})
 	opts := jsonclient.Options{PublicKey: string(pemPK), UserAgent: "gungnir-" + uuid.New().String()}
-	c, err := client.New(url, &http.Client{
-		Timeout: 27 * time.Second,
-		Transport: &http.Transport{
-			TLSHandshakeTimeout:   30 * time.Second,
-			ResponseHeaderTimeout: 30 * time.Second,
-			MaxIdleConnsPerHost:   10,
-			DisableKeepAlives:     false,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
-	}, opts)
+	
+	// CRITICAL FIX: Create HTTP transport that prevents HTTP/2 deadlock
+	// All original timeout and connection values preserved exactly
+	transport := &http.Transport{
+		// ONLY CHANGE: Disable HTTP/2 to prevent context cancellation deadlock
+		TLSNextProto: make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+		
+		TLSHandshakeTimeout:   30 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		MaxIdleConnsPerHost:   10,
+		DisableKeepAlives:     false,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	
+	httpClient := &http.Client{
+		Timeout:   27 * time.Second,
+		Transport: transport,
+	}
+	
+	c, err := client.New(url, httpClient, opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create JSON client: %v", err)
 	}
