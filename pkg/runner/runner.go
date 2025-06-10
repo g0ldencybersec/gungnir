@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -36,6 +37,11 @@ var (
 	}
 )
 
+type LogState struct {
+	consecutiveFailures int32
+	mutex              sync.RWMutex
+}
+
 type Runner struct {
 	options     *Options
 	logClients  []types.CtLog
@@ -51,6 +57,7 @@ type Runner struct {
 	actorPID       *actor.PID
 	useActor       bool
 	actorEngine    *actor.Engine
+	logStates      map[string]*LogState
 }
 
 func (r *Runner) loadRootDomains() error {
@@ -111,11 +118,42 @@ func (r *Runner) setupFileWatcher() error {
 	return watcher.Add(r.options.RootList)
 }
 
+// Simple failure tracking
+func (r *Runner) getLogState(logName string) *LogState {
+	if state, exists := r.logStates[logName]; exists {
+		return state
+	}
+	
+	state := &LogState{consecutiveFailures: 0}
+	r.logStates[logName] = state
+	return state
+}
+
+func (r *Runner) recordFailure(logName string) {
+	state := r.getLogState(logName)
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+	atomic.AddInt32(&state.consecutiveFailures, 1)
+}
+
+func (r *Runner) recordSuccess(logName string) {
+	state := r.getLogState(logName)
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+	atomic.StoreInt32(&state.consecutiveFailures, 0)
+}
+
+func (r *Runner) getFailureCount(logName string) int32 {
+	state := r.getLogState(logName)
+	return atomic.LoadInt32(&state.consecutiveFailures)
+}
+
 func NewRunner(options *Options) (*Runner, error) {
 	runner := &Runner{
 		options:     options,
 		rootDomains: make(map[string]bool),
 		restartChan: make(chan struct{}),
+		logStates:   make(map[string]*LogState),
 	}
 
 	if err := runner.loadRootDomains(); err != nil {
@@ -174,6 +212,7 @@ func NewRunner(options *Options) (*Runner, error) {
 
 	return runner, nil
 }
+
 func (r *Runner) Run() {
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithCancel(context.Background())
@@ -259,20 +298,29 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 	var start, end int64
 	var err error
 
-	// Retry fetching the initial STH with context-aware back-off
+	// Better retry with deadlock recovery
 	for retries := 0; retries < 3; retries++ {
-		if err = r.fetchAndUpdateSTH(ctx, ctl, &end); err != nil {
-			if r.options.Verbose {
-				fmt.Fprintf(os.Stderr, "Retry %d: Failed to get initial STH for log %s: %v\n", retries+1, ctl.Client.BaseURI(), err)
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(60 * time.Second): // Wait with context awareness
-				continue
-			}
+		// Wrap in timeout context to prevent hanging
+		timeoutCtx, timeoutCancel := context.WithTimeout(ctx, 30*time.Second)
+		err = r.fetchAndUpdateSTH(timeoutCtx, ctl, &end)
+		timeoutCancel()
+		
+		if err == nil {
+			r.recordSuccess(ctl.Name)
+			break
 		}
-		break
+		
+		r.recordFailure(ctl.Name)
+		
+		if r.options.Verbose {
+			fmt.Fprintf(os.Stderr, "Retry %d: Failed to get initial STH for log %s: %v\n", retries+1, ctl.Client.BaseURI(), err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(60 * time.Second):
+			continue
+		}
 	}
 
 	start = end - 20
@@ -282,18 +330,41 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// Skip if too many consecutive failures
+			if r.getFailureCount(ctl.Name) > 10 {
+				if r.options.Verbose {
+					fmt.Fprintf(os.Stderr, "Temporarily skipping %s due to repeated failures\n", ctl.Name)
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(60 * time.Second): // Skip for a minute then retry
+					r.recordSuccess(ctl.Name) // Reset failure count
+					continue
+				}
+			}
+			
 			if start >= end {
-				if err = r.fetchAndUpdateSTH(ctx, ctl, &end); err != nil {
+				// Timeout wrapper to prevent hanging
+				timeoutCtx, timeoutCancel := context.WithTimeout(ctx, 20*time.Second)
+				err = r.fetchAndUpdateSTH(timeoutCtx, ctl, &end)
+				timeoutCancel()
+				
+				if err != nil {
+					r.recordFailure(ctl.Name)
 					if r.options.Verbose {
 						fmt.Fprintf(os.Stderr, "Failed to update STH: %v\n", err)
 					}
 					select {
 					case <-ctx.Done():
 						return
-					case <-time.After(60 * time.Second): // Wait with context awareness
+					case <-time.After(60 * time.Second):
 					}
 					continue
+				} else {
+					r.recordSuccess(ctl.Name)
 				}
+				
 				if r.options.Debug {
 					if end-start > 25 {
 						fmt.Fprintf(os.Stderr, "%s is behind by: %d\n", ctl.Name, end-start)
@@ -309,15 +380,21 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 					if batchEnd > end {
 						batchEnd = end
 					}
-					entries, err := ctl.Client.GetRawEntries(ctx, start, batchEnd)
+					
+					// Timeout wrapper to prevent deadlock
+					timeoutCtx, timeoutCancel := context.WithTimeout(ctx, 35*time.Second)
+					entries, err := ctl.Client.GetRawEntries(timeoutCtx, start, batchEnd)
+					timeoutCancel()
+					
 					if err != nil {
+						r.recordFailure(ctl.Name)
 						if r.options.Verbose {
 							fmt.Fprintf(os.Stderr, "Error fetching entries for %s: %v", ctl.Name, err)
 						}
 						select {
 						case <-ctx.Done():
 							return
-						case <-time.After(30 * time.Second): // Wait with context awareness
+						case <-time.After(30 * time.Second):
 						}
 						break // Break this loop on error, wait for the next ticker tick.
 					}
@@ -328,21 +405,27 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 							Index:   start,
 						}
 						start += int64(len(entries.Entries))
+						r.recordSuccess(ctl.Name)
 					} else {
 						break // No more entries to process, break the loop.
 					}
 				}
 				continue // Continue with the outer loop.
 			} else { // Non Google handler
-				entries, err := ctl.Client.GetRawEntries(ctx, start, end)
+				// Timeout wrapper to prevent deadlock
+				timeoutCtx, timeoutCancel := context.WithTimeout(ctx, 35*time.Second)
+				entries, err := ctl.Client.GetRawEntries(timeoutCtx, start, end)
+				timeoutCancel()
+				
 				if err != nil {
+					r.recordFailure(ctl.Name)
 					if r.options.Verbose {
 						fmt.Fprintf(os.Stderr, "Error fetching entries for %s: %v", ctl.Name, err)
 					}
 					select {
 					case <-ctx.Done():
 						return
-					case <-time.After(60 * time.Second): // Wait with context awareness
+					case <-time.After(60 * time.Second):
 					}
 					continue
 				}
@@ -353,11 +436,13 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 						Index:   start,
 					}
 					start += int64(len(entries.Entries))
+					r.recordSuccess(ctl.Name)
 				}
 			}
 		}
 	}
 }
+
 func (r *Runner) fetchAndUpdateSTH(ctx context.Context, ctl types.CtLog, end *int64) error {
 	wsth, err := ctl.Client.GetSTH(ctx)
 	if err != nil {
@@ -635,3 +720,4 @@ func (r *Runner) logPrecertInfo(entry *ct.RawLogEntry) {
 		}
 	}
 }
+
