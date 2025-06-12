@@ -355,6 +355,12 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 					if r.options.Verbose {
 						fmt.Fprintf(os.Stderr, "Failed to update STH: %v\n", err)
 					}
+					if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline") {
+						if r.options.Verbose {
+							fmt.Fprintf(os.Stderr, "Timeout detected for %s, breaking batch\n", ctl.Name)
+						}
+						break
+					}
 					select {
 					case <-ctx.Done():
 						return
@@ -390,6 +396,11 @@ func (r *Runner) scanLog(ctx context.Context, ctl types.CtLog, wg *sync.WaitGrou
 						r.recordFailure(ctl.Name)
 						if r.options.Verbose {
 							fmt.Fprintf(os.Stderr, "Error fetching entries for %s: %v", ctl.Name, err)
+						}
+						if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline") {
+							if r.options.Verbose {
+								fmt.Fprintf(os.Stderr, "Timeout detected for %s, backing off\n", ctl.Name)
+							}
 						}
 						select {
 						case <-ctx.Done():
