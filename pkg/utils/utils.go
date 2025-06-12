@@ -67,7 +67,7 @@ func createLogClient(key []byte, url string) (*client.LogClient, error) {
 		TLSHandshakeTimeout:   30 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 		MaxIdleConnsPerHost:   10,
-		DisableKeepAlives:     false,
+		DisableKeepAlives:     true,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
