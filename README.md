@@ -14,6 +14,8 @@ By running Gungnir continuously, security professionals can stay ahead of the cu
 - **Domain Extraction:** Extracts domains and subdomains from certificate subject alternative names and common name.
 - **Continuous Output:** Prints discovered domains and subdomains to stdout as they are detected.
 - **Customizable Filtering:** Allows filtering output based a text file of root domains.
+- **Memory-Efficient Deduplication:** Uses Bloom filters to prevent duplicate domain output without consuming excessive memory, even when processing millions of domains.
+
 Gungnir is designed to be a lightweight and efficient tool, making it suitable for running on various platforms, from local machines to cloud instances or containerized environments.
 
 ## Installation
@@ -26,29 +28,81 @@ go install github.com/g0ldencybersec/gungnir/cmd/gungnir@latest
 # Options
 ```sh
 Usage of gungnir:
-  -debug  Debug CT logs to see if you are keeping up
-  -f      Monitor the root domain file for updates and restart the scan. requires the -r flag
-  -j      JSONL output cert info
-  -nc     NATs subject to publish domains to
-  -ns     NATs subject to publish domains to
-  -nu     NATs URL to publish domains to
-  -o      Directory to store output files (one per hostname, requires -r flag)
-  -r      Path to the list of root domains to filter against
-  -v      Output go logs (500/429 errors) to command line
+  -debug            Debug CT logs to see if you are keeping up
+  -dedup            Enable domain deduplication using Bloom filter (default: true)
+  -dedup-capacity   Bloom filter capacity (number of domains to track) (default: 10000000)
+  -dedup-fpr        Bloom filter false positive rate (default: 0.001 = 0.1%%)
+  -f                Monitor the root domain file for updates and restart the scan. requires the -r flag
+  -j                JSONL output cert info
+  -nc               NATs credentials file to publish domains to
+  -ns               NATs subject to publish domains to
+  -nu               NATs URL to publish domains to
+  -o                Directory to store output files (one per hostname, requires -r flag)
+  -r                Path to the list of root domains to filter against
+  -v                Output go logs (500/429 errors) to command line
 ```
 
 To run the tool, use a text file of root domains you want to monitor: `roots.txt`. Then, run the `gungnir` module:
 
 ```sh
-./gungnir -r roots.txt (filtered)
+gungnir -r roots.txt (filtered)
 - or -
-./gungnir -r roots.txt -f (filtered and following)
+gungnir -r roots.txt -f (filtered and following)
 - or -
-./gungnir (unfiltered)
+gungnir (unfiltered)
 
 ```
 
 Once the tool starts and initializes, it will print domains to stdout. So feel free to pipe the output into your favorite tool!
+
+## Deduplication
+
+Gungnir includes a memory-efficient deduplication feature that prevents duplicate domains from being output, even when processing millions of domains. This feature uses Bloom filters, a probabilistic data structure that provides constant memory usage regardless of the number of domains processed.
+
+### How It Works
+
+- **Bloom Filter Technology:** Uses probabilistic data structures that use fixed memory (typically 5-15MB) regardless of domain count
+- **Zero False Negatives:** If a domain is marked as new, it's definitely new (no duplicates will slip through)
+- **Configurable False Positive Rate:** Small chance (default 0.1%) that a duplicate might be allowed through, but this is an acceptable trade-off for memory efficiency
+- **Per-File Deduplication:** When using file output mode (`-o`), each root domain file has its own deduplicator
+- **Global Deduplication:** For stdout/NATS/Actor modes, a single global deduplicator tracks all domains
+
+### Memory Usage
+
+The deduplication feature uses constant memory based on your configuration:
+
+| Capacity | False Positive Rate | Memory Usage |
+|----------|---------------------|--------------|
+| 1M       | 0.1%                | ~1.4MB       |
+| 10M      | 0.1%                | ~14.4MB      |
+| 100M     | 0.1%                | ~144MB       |
+| 10M      | 1%                  | ~9.6MB       |
+
+### Usage Examples
+
+```sh
+# Use default deduplication (enabled, 10M capacity, 0.1% FPR)
+gungnir -r roots.txt
+
+# Disable deduplication
+gungnir -r roots.txt -dedup=false
+
+# Custom capacity for high-volume processing
+gungnir -r roots.txt -dedup-capacity=50000000
+
+# Lower memory usage with slightly higher false positive rate
+gungnir -r roots.txt -dedup-capacity=10000000 -dedup-fpr=0.01
+
+# View deduplicator stats (use -v flag)
+gungnir -r roots.txt -v
+```
+
+### When to Adjust Settings
+
+- **High Volume (100K+ domains/hour):** Increase capacity to 50M-100M
+- **Low Memory Systems:** Reduce capacity to 1M-5M or increase FPR to 1%
+- **Maximum Precision:** Keep default settings (10M capacity, 0.1% FPR)
+- **Disable Deduplication:** Use `-dedup=false` if you need exact duplicate tracking (not recommended for high-volume scenarios)
 
 ## Warranty
 

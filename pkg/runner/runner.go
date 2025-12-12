@@ -21,6 +21,7 @@ import (
 	"github.com/nats-io/nats.go"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/g0ldencybersec/gungnir/pkg/deduplicator"
 	"github.com/g0ldencybersec/gungnir/pkg/types"
 )
 
@@ -41,16 +42,18 @@ type Runner struct {
 	logClients  []types.CtLog
 	rootDomains map[string]bool
 	// followFile     map[string]bool
-	rateLimitMap   map[string]time.Duration
-	entryTasksChan chan types.EntryTask
-	watcher        *fsnotify.Watcher
-	restartChan    chan struct{}
-	outputMutex    sync.Mutex
-	natsPub        bool
-	natsConn       *nats.Conn
-	actorPID       *actor.PID
-	useActor       bool
-	actorEngine    *actor.Engine
+	rateLimitMap     map[string]time.Duration
+	entryTasksChan   chan types.EntryTask
+	watcher          *fsnotify.Watcher
+	restartChan      chan struct{}
+	outputMutex      sync.Mutex
+	natsPub          bool
+	natsConn         *nats.Conn
+	actorPID         *actor.PID
+	useActor         bool
+	actorEngine      *actor.Engine
+	deduplicator     *deduplicator.Deduplicator
+	fileDeduplicator *deduplicator.FileDeduplicator
 }
 
 func (r *Runner) loadRootDomains() error {
@@ -171,6 +174,31 @@ func NewRunner(options *Options) (*Runner, error) {
 
 	runner.entryTasksChan = make(chan types.EntryTask, len(runner.logClients)*100)
 	runner.rateLimitMap = defaultRateLimitMap
+
+	// Initialize deduplicators
+	dedupConfig := deduplicator.Config{
+		Enabled:      runner.options.DedupEnabled,
+		Capacity:     runner.options.DedupCapacity,
+		FalsePosRate: runner.options.DedupFalsePosRate,
+	}
+
+	// For file output mode, use per-file deduplicator
+	if runner.options.OutputDir != "" && len(runner.rootDomains) > 0 {
+		runner.fileDeduplicator = deduplicator.NewFileDeduplicator(dedupConfig)
+		if runner.options.Verbose {
+			stats := runner.fileDeduplicator.GetStats()
+			log.Printf("File deduplicator initialized: enabled=%v, capacity=%d, FPR=%.4f, estimated memory=%d bytes",
+				stats.Enabled, stats.Capacity, stats.FalsePosRate, stats.MemoryUsage)
+		}
+	} else {
+		// For stdout/NATS/Actor modes, use global deduplicator
+		runner.deduplicator = deduplicator.NewDeduplicator(dedupConfig)
+		if runner.options.Verbose {
+			stats := runner.deduplicator.GetStats()
+			log.Printf("Deduplicator initialized: enabled=%v, capacity=%d, FPR=%.4f, estimated memory=%d bytes",
+				stats.Enabled, stats.Capacity, stats.FalsePosRate, stats.MemoryUsage)
+		}
+	}
 
 	return runner, nil
 }
@@ -436,6 +464,14 @@ func (r *Runner) writeToHostFile(hostname string, data interface{}) error {
 
 	filePath := filepath.Join(r.options.OutputDir, safeRootDomain+".txt")
 
+	// Check for duplicates using per-file deduplicator
+	if r.fileDeduplicator != nil {
+		if r.fileDeduplicator.CheckAndAdd(filePath, hostname) {
+			// Domain is duplicate, skip writing
+			return nil
+		}
+	}
+
 	// Use mutex to prevent concurrent file access
 	r.outputMutex.Lock()
 	defer r.outputMutex.Unlock()
@@ -482,43 +518,59 @@ func (r *Runner) logCertInfo(entry *ct.RawLogEntry) {
 	// Only process if we have root domains and output directory
 	if r.options.OutputDir != "" && len(r.rootDomains) > 0 {
 		// Handle CommonName
-		if parsedEntry.X509Cert.Subject.CommonName != "" {
-			if err := r.writeToHostFile(parsedEntry.X509Cert.Subject.CommonName, parsedEntry.X509Cert); err != nil {
+		cn := strings.TrimSpace(parsedEntry.X509Cert.Subject.CommonName)
+		if cn != "" {
+			if err := r.writeToHostFile(cn, parsedEntry.X509Cert); err != nil {
 				if r.options.Verbose {
-					log.Printf("Error writing to file for %s: %v", parsedEntry.X509Cert.Subject.CommonName, err)
+					log.Printf("Error writing to file for %s: %v", cn, err)
 				}
 			}
 		}
 
 		// Handle DNS names
 		for _, domain := range parsedEntry.X509Cert.DNSNames {
-			if err := r.writeToHostFile(domain, parsedEntry.X509Cert); err != nil {
-				if r.options.Verbose {
-					log.Printf("Error writing to file for %s: %v", domain, err)
+			domain = strings.TrimSpace(domain)
+			if domain != "" {
+				if err := r.writeToHostFile(domain, parsedEntry.X509Cert); err != nil {
+					if r.options.Verbose {
+						log.Printf("Error writing to file for %s: %v", domain, err)
+					}
 				}
 			}
 		}
 	} else if r.useActor {
-		if utils.IsSubdomain(parsedEntry.X509Cert.Subject.CommonName, r.rootDomains) {
-			r.actorEngine.Send(r.actorPID, &types.GungnirMessage{Domain: parsedEntry.X509Cert.Subject.CommonName})
+		cn := strings.TrimSpace(parsedEntry.X509Cert.Subject.CommonName)
+		if cn != "" && utils.IsSubdomain(cn, r.rootDomains) {
+			if r.deduplicator == nil || !r.deduplicator.CheckAndAdd(cn) {
+				r.actorEngine.Send(r.actorPID, &types.GungnirMessage{Domain: cn})
+			}
 		}
 		for _, domain := range parsedEntry.X509Cert.DNSNames {
-			if utils.IsSubdomain(domain, r.rootDomains) {
-				r.actorEngine.Send(r.actorPID, &types.GungnirMessage{Domain: domain})
+			domain = strings.TrimSpace(domain)
+			if domain != "" && utils.IsSubdomain(domain, r.rootDomains) {
+				if r.deduplicator == nil || !r.deduplicator.CheckAndAdd(domain) {
+					r.actorEngine.Send(r.actorPID, &types.GungnirMessage{Domain: domain})
+				}
 			}
 		}
 	} else if r.natsPub {
-		if utils.IsSubdomain(parsedEntry.X509Cert.Subject.CommonName, r.rootDomains) {
-			err := r.natsConn.Publish(r.options.NatsSubject, []byte(parsedEntry.X509Cert.Subject.CommonName))
-			if err != nil {
-				log.Printf("Error writing to NATs: %v", err)
+		cn := strings.TrimSpace(parsedEntry.X509Cert.Subject.CommonName)
+		if cn != "" && utils.IsSubdomain(cn, r.rootDomains) {
+			if r.deduplicator == nil || !r.deduplicator.CheckAndAdd(cn) {
+				err := r.natsConn.Publish(r.options.NatsSubject, []byte(cn))
+				if err != nil {
+					log.Printf("Error writing to NATs: %v", err)
+				}
 			}
 		}
 		for _, domain := range parsedEntry.X509Cert.DNSNames {
-			if utils.IsSubdomain(domain, r.rootDomains) {
-				err := r.natsConn.Publish(r.options.NatsSubject, []byte(domain))
-				if err != nil {
-					log.Printf("Error writing to NATs: %v", err)
+			domain = strings.TrimSpace(domain)
+			if domain != "" && utils.IsSubdomain(domain, r.rootDomains) {
+				if r.deduplicator == nil || !r.deduplicator.CheckAndAdd(domain) {
+					err := r.natsConn.Publish(r.options.NatsSubject, []byte(domain))
+					if err != nil {
+						log.Printf("Error writing to NATs: %v", err)
+					}
 				}
 			}
 		}
@@ -526,27 +578,43 @@ func (r *Runner) logCertInfo(entry *ct.RawLogEntry) {
 		// Original stdout output behavior
 		if len(r.rootDomains) == 0 {
 			if r.options.JsonOutput {
-				utils.JsonOutput(parsedEntry.X509Cert)
+				// For JSON output without filtering, check all domains
+				cn := strings.TrimSpace(parsedEntry.X509Cert.Subject.CommonName)
+				if cn != "" && (r.deduplicator == nil || !r.deduplicator.CheckAndAdd(cn)) {
+					utils.JsonOutput(parsedEntry.X509Cert)
+				}
 			} else {
-				fmt.Println(parsedEntry.X509Cert.Subject.CommonName)
+				cn := strings.TrimSpace(parsedEntry.X509Cert.Subject.CommonName)
+				if cn != "" && (r.deduplicator == nil || !r.deduplicator.CheckAndAdd(cn)) {
+					fmt.Println(cn)
+				}
 				for _, domain := range parsedEntry.X509Cert.DNSNames {
-					fmt.Println(domain)
+					domain = strings.TrimSpace(domain)
+					if domain != "" && (r.deduplicator == nil || !r.deduplicator.CheckAndAdd(domain)) {
+						fmt.Println(domain)
+					}
 				}
 			}
 		} else {
-			if utils.IsSubdomain(parsedEntry.X509Cert.Subject.CommonName, r.rootDomains) {
-				if r.options.JsonOutput {
-					utils.JsonOutput(parsedEntry.X509Cert)
-				} else {
-					fmt.Println(parsedEntry.X509Cert.Subject.CommonName)
-				}
-			}
-			for _, domain := range parsedEntry.X509Cert.DNSNames {
-				if utils.IsSubdomain(domain, r.rootDomains) {
+			cn := strings.TrimSpace(parsedEntry.X509Cert.Subject.CommonName)
+			if cn != "" && utils.IsSubdomain(cn, r.rootDomains) {
+				if r.deduplicator == nil || !r.deduplicator.CheckAndAdd(cn) {
 					if r.options.JsonOutput {
 						utils.JsonOutput(parsedEntry.X509Cert)
 					} else {
-						fmt.Println(domain)
+						fmt.Println(cn)
+					}
+				}
+			}
+			for _, domain := range parsedEntry.X509Cert.DNSNames {
+				domain = strings.TrimSpace(domain)
+				if domain != "" && utils.IsSubdomain(domain, r.rootDomains) {
+					if r.deduplicator == nil || !r.deduplicator.CheckAndAdd(domain) {
+						if r.options.JsonOutput {
+							utils.JsonOutput(parsedEntry.X509Cert)
+						} else {
+							fmt.Println(domain)
+						}
 					}
 				}
 			}
@@ -564,43 +632,59 @@ func (r *Runner) logPrecertInfo(entry *ct.RawLogEntry) {
 	// Only process if we have root domains and output directory
 	if r.options.OutputDir != "" && len(r.rootDomains) > 0 {
 		// Handle CommonName
-		if parsedEntry.Precert.TBSCertificate.Subject.CommonName != "" {
-			if err := r.writeToHostFile(parsedEntry.Precert.TBSCertificate.Subject.CommonName, parsedEntry.Precert.TBSCertificate); err != nil {
+		cn := strings.TrimSpace(parsedEntry.Precert.TBSCertificate.Subject.CommonName)
+		if cn != "" {
+			if err := r.writeToHostFile(cn, parsedEntry.Precert.TBSCertificate); err != nil {
 				if r.options.Verbose {
-					log.Printf("Error writing to file for %s: %v", parsedEntry.Precert.TBSCertificate.Subject.CommonName, err)
+					log.Printf("Error writing to file for %s: %v", cn, err)
 				}
 			}
 		}
 
 		// Handle DNS names
 		for _, domain := range parsedEntry.Precert.TBSCertificate.DNSNames {
-			if err := r.writeToHostFile(domain, parsedEntry.Precert.TBSCertificate); err != nil {
-				if r.options.Verbose {
-					log.Printf("Error writing to file for %s: %v", domain, err)
+			domain = strings.TrimSpace(domain)
+			if domain != "" {
+				if err := r.writeToHostFile(domain, parsedEntry.Precert.TBSCertificate); err != nil {
+					if r.options.Verbose {
+						log.Printf("Error writing to file for %s: %v", domain, err)
+					}
 				}
 			}
 		}
 	} else if r.useActor {
-		if utils.IsSubdomain(parsedEntry.Precert.TBSCertificate.Subject.CommonName, r.rootDomains) {
-			r.actorEngine.Send(r.actorPID, &types.GungnirMessage{Domain: parsedEntry.Precert.TBSCertificate.Subject.CommonName})
+		cn := strings.TrimSpace(parsedEntry.Precert.TBSCertificate.Subject.CommonName)
+		if cn != "" && utils.IsSubdomain(cn, r.rootDomains) {
+			if r.deduplicator == nil || !r.deduplicator.CheckAndAdd(cn) {
+				r.actorEngine.Send(r.actorPID, &types.GungnirMessage{Domain: cn})
+			}
 		}
 		for _, domain := range parsedEntry.Precert.TBSCertificate.DNSNames {
-			if utils.IsSubdomain(domain, r.rootDomains) {
-				r.actorEngine.Send(r.actorPID, &types.GungnirMessage{Domain: domain})
+			domain = strings.TrimSpace(domain)
+			if domain != "" && utils.IsSubdomain(domain, r.rootDomains) {
+				if r.deduplicator == nil || !r.deduplicator.CheckAndAdd(domain) {
+					r.actorEngine.Send(r.actorPID, &types.GungnirMessage{Domain: domain})
+				}
 			}
 		}
 	} else if r.natsPub {
-		if utils.IsSubdomain(parsedEntry.Precert.TBSCertificate.Subject.CommonName, r.rootDomains) {
-			err := r.natsConn.Publish(r.options.NatsSubject, []byte(parsedEntry.Precert.TBSCertificate.Subject.CommonName))
-			if err != nil {
-				log.Printf("Error writing to NATs: %v", err)
+		cn := strings.TrimSpace(parsedEntry.Precert.TBSCertificate.Subject.CommonName)
+		if cn != "" && utils.IsSubdomain(cn, r.rootDomains) {
+			if r.deduplicator == nil || !r.deduplicator.CheckAndAdd(cn) {
+				err := r.natsConn.Publish(r.options.NatsSubject, []byte(cn))
+				if err != nil {
+					log.Printf("Error writing to NATs: %v", err)
+				}
 			}
 		}
 		for _, domain := range parsedEntry.Precert.TBSCertificate.DNSNames {
-			if utils.IsSubdomain(domain, r.rootDomains) {
-				err := r.natsConn.Publish(r.options.NatsSubject, []byte(domain))
-				if err != nil {
-					log.Printf("Error writing to NATs: %v", err)
+			domain = strings.TrimSpace(domain)
+			if domain != "" && utils.IsSubdomain(domain, r.rootDomains) {
+				if r.deduplicator == nil || !r.deduplicator.CheckAndAdd(domain) {
+					err := r.natsConn.Publish(r.options.NatsSubject, []byte(domain))
+					if err != nil {
+						log.Printf("Error writing to NATs: %v", err)
+					}
 				}
 			}
 		}
@@ -608,27 +692,43 @@ func (r *Runner) logPrecertInfo(entry *ct.RawLogEntry) {
 		// Original stdout output behavior
 		if len(r.rootDomains) == 0 {
 			if r.options.JsonOutput {
-				utils.JsonOutput(parsedEntry.Precert.TBSCertificate)
+				// For JSON output without filtering, check all domains
+				cn := strings.TrimSpace(parsedEntry.Precert.TBSCertificate.Subject.CommonName)
+				if cn != "" && (r.deduplicator == nil || !r.deduplicator.CheckAndAdd(cn)) {
+					utils.JsonOutput(parsedEntry.Precert.TBSCertificate)
+				}
 			} else {
-				fmt.Println(parsedEntry.Precert.TBSCertificate.Subject.CommonName)
+				cn := strings.TrimSpace(parsedEntry.Precert.TBSCertificate.Subject.CommonName)
+				if cn != "" && (r.deduplicator == nil || !r.deduplicator.CheckAndAdd(cn)) {
+					fmt.Println(cn)
+				}
 				for _, domain := range parsedEntry.Precert.TBSCertificate.DNSNames {
-					fmt.Println(domain)
+					domain = strings.TrimSpace(domain)
+					if domain != "" && (r.deduplicator == nil || !r.deduplicator.CheckAndAdd(domain)) {
+						fmt.Println(domain)
+					}
 				}
 			}
 		} else {
-			if utils.IsSubdomain(parsedEntry.Precert.TBSCertificate.Subject.CommonName, r.rootDomains) {
-				if r.options.JsonOutput {
-					utils.JsonOutput(parsedEntry.Precert.TBSCertificate)
-				} else {
-					fmt.Println(parsedEntry.Precert.TBSCertificate.Subject.CommonName)
-				}
-			}
-			for _, domain := range parsedEntry.Precert.TBSCertificate.DNSNames {
-				if utils.IsSubdomain(domain, r.rootDomains) {
+			cn := strings.TrimSpace(parsedEntry.Precert.TBSCertificate.Subject.CommonName)
+			if cn != "" && utils.IsSubdomain(cn, r.rootDomains) {
+				if r.deduplicator == nil || !r.deduplicator.CheckAndAdd(cn) {
 					if r.options.JsonOutput {
 						utils.JsonOutput(parsedEntry.Precert.TBSCertificate)
 					} else {
-						fmt.Println(domain)
+						fmt.Println(cn)
+					}
+				}
+			}
+			for _, domain := range parsedEntry.Precert.TBSCertificate.DNSNames {
+				domain = strings.TrimSpace(domain)
+				if domain != "" && utils.IsSubdomain(domain, r.rootDomains) {
+					if r.deduplicator == nil || !r.deduplicator.CheckAndAdd(domain) {
+						if r.options.JsonOutput {
+							utils.JsonOutput(parsedEntry.Precert.TBSCertificate)
+						} else {
+							fmt.Println(domain)
+						}
 					}
 				}
 			}

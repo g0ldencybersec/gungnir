@@ -8,17 +8,20 @@ import (
 )
 
 type Options struct {
-	Verbose      bool
-	RootList     string
-	Debug        bool
-	JsonOutput   bool
-	WatchFile    bool
-	OutputDir    string
-	NatsSubject  string
-	NatsUrl      string
-	NatsCredFile string
-	ActorPID     *actor.PID
-	ActorEngine  *actor.Engine
+	Verbose           bool
+	RootList          string
+	Debug             bool
+	JsonOutput        bool
+	WatchFile         bool
+	OutputDir         string
+	NatsSubject       string
+	NatsUrl           string
+	NatsCredFile      string
+	ActorPID          *actor.PID
+	ActorEngine       *actor.Engine
+	DedupEnabled      bool
+	DedupCapacity     uint
+	DedupFalsePosRate float64
 }
 
 func ParseOptions() (*Options, error) {
@@ -33,6 +36,9 @@ func ParseOptions() (*Options, error) {
 	flag.StringVar(&options.NatsSubject, "ns", "", "NATs subject to publish domains to")
 	flag.StringVar(&options.NatsUrl, "nu", "", "NATs URL to publish domains to")
 	flag.StringVar(&options.NatsCredFile, "nc", "", "NATs subject to publish domains to")
+	flag.BoolVar(&options.DedupEnabled, "dedup", true, "Enable domain deduplication using Bloom filter")
+	flag.UintVar(&options.DedupCapacity, "dedup-capacity", 10000000, "Bloom filter capacity (number of domains to track)")
+	flag.Float64Var(&options.DedupFalsePosRate, "dedup-fpr", 0.001, "Bloom filter false positive rate (0.001 = 0.1%%)")
 	flag.Parse()
 
 	// Validate that output directory is only used with root list
