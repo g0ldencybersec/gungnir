@@ -1,8 +1,7 @@
 package types
 
 import (
-	"net"
-
+	"filippo.io/sunlight"
 	ct "github.com/google/certificate-transparency-go"
 	"github.com/google/certificate-transparency-go/client"
 )
@@ -15,6 +14,14 @@ type CtLog struct {
 	Client *client.LogClient
 }
 
+// StaticCtLog contains info for a static/tiled CT log using the sunlight library.
+type StaticCtLog struct {
+	Id            string
+	Name          string
+	MonitoringURL string
+	Client        *sunlight.Client
+}
+
 type EntryTask struct {
 	Entries *ct.GetEntriesResponse
 	Index   int64
@@ -22,14 +29,11 @@ type EntryTask struct {
 
 // Result Types
 type CertificateInfo struct {
-	OriginIP         string   `json:"originip"`
-	Organization     []string `json:"org"`
-	OrganizationUnit []string `json:"orgunit"`
-	CommonName       string   `json:"commonName"`
-	SAN              []string `json:"san"`
-	Domains          []string `json:"domains"`
-	Emails           []string `json:"emails"`
-	IPAddrs          []net.IP `json:"ips"`
+	CommonName   string   `json:"commonName"`
+	Organization []string `json:"org"`
+	SAN          []string `json:"san"`
+	Domains      []string `json:"domains"`
+	Source       string   `json:"source"`
 }
 
 type GungnirMessage struct {

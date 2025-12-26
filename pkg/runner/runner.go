@@ -9,11 +9,13 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"filippo.io/sunlight"
 	"github.com/anthdm/hollywood/actor"
 	"github.com/g0ldencybersec/gungnir/pkg/utils"
 	ct "github.com/google/certificate-transparency-go"
@@ -41,16 +43,17 @@ type Runner struct {
 	logClients  []types.CtLog
 	rootDomains map[string]bool
 	// followFile     map[string]bool
-	rateLimitMap   map[string]time.Duration
-	entryTasksChan chan types.EntryTask
-	watcher        *fsnotify.Watcher
-	restartChan    chan struct{}
-	outputMutex    sync.Mutex
-	natsPub        bool
-	natsConn       *nats.Conn
-	actorPID       *actor.PID
-	useActor       bool
-	actorEngine    *actor.Engine
+	rateLimitMap     map[string]time.Duration
+	entryTasksChan   chan types.EntryTask
+	watcher          *fsnotify.Watcher
+	restartChan      chan struct{}
+	outputMutex      sync.Mutex
+	natsPub          bool
+	natsConn         *nats.Conn
+	actorPID         *actor.PID
+	useActor         bool
+	actorEngine      *actor.Engine
+	staticLogClients []types.StaticCtLog
 }
 
 func (r *Runner) loadRootDomains() error {
@@ -139,6 +142,14 @@ func NewRunner(options *Options) (*Runner, error) {
 		return nil, fmt.Errorf("failed to populate logs: %v", err)
 	}
 
+	// Populate static CT logs (tiled logs)
+	runner.staticLogClients, err = utils.PopulateStaticLogs(logListUrl)
+	if err != nil {
+		// Log the error but don't fail - static logs are supplementary
+		fmt.Fprintf(os.Stderr, "Warning: failed to populate static logs: %v\n", err)
+		runner.staticLogClients = []types.StaticCtLog{}
+	}
+
 	// NATS setup if needed
 	if runner.options.NatsSubject != "" && runner.options.NatsUrl != "" && runner.options.NatsCredFile != "" {
 		nc, err := nats.Connect(runner.options.NatsUrl, nats.UserCredentials(runner.options.NatsCredFile))
@@ -222,6 +233,12 @@ func (r *Runner) startScan(ctx context.Context, wg *sync.WaitGroup) {
 	for _, ctl := range r.logClients {
 		wg.Add(1)
 		go r.scanLog(ctx, ctl, wg)
+	}
+
+	// Start scanning static CT logs
+	for _, staticLog := range r.staticLogClients {
+		wg.Add(1)
+		go r.scanStaticLog(ctx, staticLog, wg)
 	}
 }
 
@@ -365,6 +382,192 @@ func (r *Runner) fetchAndUpdateSTH(ctx context.Context, ctl types.CtLog, end *in
 	}
 	*end = int64(wsth.TreeSize)
 	return nil
+}
+
+// getStaticTreeEnd fetches the tree size from a static CT log's checkpoint
+func (r *Runner) getStaticTreeEnd(ctx context.Context, client *types.StaticCtLog) (int64, error) {
+	fetchCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	checkpoint, err := client.Client.Fetcher().ReadEndpoint(fetchCtx, "checkpoint")
+	if err != nil {
+		return 0, fmt.Errorf("failed to read checkpoint: %w", err)
+	}
+
+	_, rest, found := strings.Cut(string(checkpoint), "\n")
+	if !found {
+		return 0, fmt.Errorf("invalid checkpoint format: no newline found")
+	}
+
+	size, _, found := strings.Cut(rest, "\n")
+	if !found {
+		return 0, fmt.Errorf("invalid checkpoint format: size line not found")
+	}
+
+	treeSize, err := strconv.ParseInt(size, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse tree size '%s': %w", size, err)
+	}
+
+	return treeSize, nil
+}
+
+// scanStaticLog monitors a static/tiled CT log and processes entries
+func (r *Runner) scanStaticLog(ctx context.Context, staticLog types.StaticCtLog, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	// Get initial tree end
+	end, err := r.getStaticTreeEnd(ctx, &staticLog)
+	if err != nil {
+		if r.options.Verbose {
+			fmt.Fprintf(os.Stderr, "Error getting tree size for static log %s: %v\n", staticLog.Name, err)
+		}
+		return
+	}
+
+	// Start slightly behind to catch recent entries
+	start := end - 200
+	if start < 0 {
+		start = 0
+	}
+
+	// Helper function to process entries
+	processStaticEntries := func() bool {
+		if ctx.Err() != nil {
+			return false
+		}
+
+		for i, entry := range staticLog.Client.UnauthenticatedTrimmedEntries(ctx, start, end) {
+			select {
+			case <-ctx.Done():
+				return false
+			default:
+			}
+
+			// Process CommonName
+			if entry.Subject.CommonName != "" {
+				r.outputStaticDomain(entry.Subject.CommonName, entry)
+			}
+
+			// Process DNS SANs
+			for _, dnsName := range entry.DNS {
+				if dnsName != entry.Subject.CommonName {
+					r.outputStaticDomain(dnsName, entry)
+				}
+			}
+
+			start = i + 1
+		}
+
+		if err := staticLog.Client.Err(); err != nil {
+			if r.options.Verbose {
+				fmt.Fprintf(os.Stderr, "Error reading entries for static log %s: %v\n", staticLog.Name, err)
+			}
+			return false
+		}
+
+		// Update positions
+		start = end
+		end, err = r.getStaticTreeEnd(ctx, &staticLog)
+		if err != nil {
+			if r.options.Verbose {
+				fmt.Fprintf(os.Stderr, "Error getting tree end for static log %s: %v\n", staticLog.Name, err)
+			}
+			return false
+		}
+		return true
+	}
+
+	// Do initial fetch
+	if !processStaticEntries() {
+		return
+	}
+
+	// Continue with ticker-based fetches
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !processStaticEntries() {
+				return
+			}
+		}
+	}
+}
+
+// outputStaticDomain handles outputting a domain from a static CT log entry
+// It respects all the same options as the standard CT log output
+func (r *Runner) outputStaticDomain(domain string, entry *sunlight.TrimmedEntry) {
+	// Handle output directory mode
+	if r.options.OutputDir != "" && len(r.rootDomains) > 0 {
+		if err := r.writeToHostFile(domain, entry); err != nil {
+			if r.options.Verbose {
+				log.Printf("Error writing to file for %s: %v", domain, err)
+			}
+		}
+		return
+	}
+
+	// Handle actor mode
+	if r.useActor {
+		if utils.IsSubdomain(domain, r.rootDomains) {
+			r.actorEngine.Send(r.actorPID, &types.GungnirMessage{Domain: domain})
+		}
+		return
+	}
+
+	// Handle NATS mode
+	if r.natsPub {
+		if utils.IsSubdomain(domain, r.rootDomains) {
+			err := r.natsConn.Publish(r.options.NatsSubject, []byte(domain))
+			if err != nil {
+				log.Printf("Error writing to NATs: %v", err)
+			}
+		}
+		return
+	}
+
+	// Standard stdout output
+	if len(r.rootDomains) == 0 {
+		// No filtering, output all domains
+		if r.options.JsonOutput {
+			r.outputStaticJson(entry)
+		} else {
+			fmt.Println(domain)
+		}
+	} else {
+		// Filter by root domains
+		if utils.IsSubdomain(domain, r.rootDomains) {
+			if r.options.JsonOutput {
+				r.outputStaticJson(entry)
+			} else {
+				fmt.Println(domain)
+			}
+		}
+	}
+}
+
+// outputStaticJson outputs a static CT entry in JSON format matching the regular CT log output
+func (r *Runner) outputStaticJson(entry *sunlight.TrimmedEntry) {
+	certInfo := types.CertificateInfo{
+		CommonName:   entry.Subject.CommonName,
+		Organization: entry.Subject.Organization,
+		SAN:          entry.DNS,
+		Domains:      append([]string{entry.Subject.CommonName}, entry.DNS...),
+		Source:       "static_ct",
+	}
+	jsonData, err := json.Marshal(certInfo)
+	if err != nil {
+		if r.options.Verbose {
+			log.Printf("Error marshaling JSON for %s: %v", entry.Subject.CommonName, err)
+		}
+		return
+	}
+	fmt.Println(string(jsonData))
 }
 
 func (r *Runner) processEntries(results *ct.GetEntriesResponse, start int64) {

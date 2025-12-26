@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"filippo.io/sunlight"
 	"github.com/g0ldencybersec/gungnir/pkg/types"
 	"github.com/google/certificate-transparency-go/loglist3"
 	"github.com/google/certificate-transparency-go/x509"
@@ -126,15 +127,95 @@ func IsSubdomain(domain string, rootDomains map[string]bool) bool {
 
 func JsonOutput(cert *x509.Certificate) {
 	certInfo := types.CertificateInfo{
-		OriginIP:         "",
-		Organization:     cert.Subject.Organization,
-		OrganizationUnit: cert.Subject.OrganizationalUnit,
-		CommonName:       cert.Subject.CommonName,
-		SAN:              cert.DNSNames,
-		Domains:          append([]string{cert.Subject.CommonName}, cert.DNSNames...),
-		Emails:           cert.EmailAddresses,
-		IPAddrs:          cert.IPAddresses,
+		CommonName:   cert.Subject.CommonName,
+		Organization: cert.Subject.Organization,
+		SAN:          cert.DNSNames,
+		Domains:      append([]string{cert.Subject.CommonName}, cert.DNSNames...),
+		Source:       "rfc6962",
 	}
 	outputJson, _ := json.Marshal(certInfo)
 	fmt.Println(string(outputJson))
+}
+
+// Static CT Log types for parsing the log list JSON
+type StaticLogList struct {
+	Operators []StaticOperator `json:"operators"`
+}
+
+type StaticOperator struct {
+	Name      string           `json:"name"`
+	Logs      []StaticLogEntry `json:"logs"`
+	TiledLogs []StaticLogEntry `json:"tiled_logs"`
+}
+
+type StaticLogEntry struct {
+	Description   string `json:"description"`
+	LogID         string `json:"log_id"`
+	MonitoringURL string `json:"monitoring_url"`
+	SubmissionURL string `json:"submission_url"`
+	URL           string `json:"url"`
+	Key           string `json:"key"`
+}
+
+// staticHttpClient is a shared HTTP client for static CT log operations
+var staticHttpClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:          200,
+		MaxIdleConnsPerHost:   50,
+		IdleConnTimeout:       30 * time.Second,
+		DisableKeepAlives:     false,
+		DisableCompression:    false,
+		MaxConnsPerHost:       100,
+		ResponseHeaderTimeout: 10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	},
+}
+
+// PopulateStaticLogs parses the log list and returns static/tiled CT logs
+func PopulateStaticLogs(logListURL string) ([]types.StaticCtLog, error) {
+	u, err := url.Parse(logListURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse URL: %v", err)
+	}
+	body, err := readURL(u)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get log list data: %v", err)
+	}
+
+	var logList StaticLogList
+	if err := json.Unmarshal(body, &logList); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON: %v", err)
+	}
+
+	var logs []types.StaticCtLog
+	for _, operator := range logList.Operators {
+		for _, log := range operator.TiledLogs {
+			// Skip logs without monitoring URL
+			if log.MonitoringURL == "" {
+				continue
+			}
+
+			client, err := sunlight.NewClient(&sunlight.ClientConfig{
+				MonitoringPrefix: log.MonitoringURL,
+				HTTPClient:       staticHttpClient,
+				UserAgent:        "gungnir +https://github.com/g0ldencybersec/gungnir",
+			})
+			if err != nil {
+				// Log error but continue with other logs
+				fmt.Fprintf(os.Stderr, "Failed to create static log client for %s: %v\n", log.Description, err)
+				continue
+			}
+
+			l := types.StaticCtLog{
+				Id:            log.LogID,
+				Name:          log.Description,
+				MonitoringURL: log.MonitoringURL,
+				Client:        client,
+			}
+			logs = append(logs, l)
+		}
+	}
+
+	return logs, nil
 }
